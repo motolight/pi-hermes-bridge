@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Fake `pi` CLI: delegates --version/--help to tests/fake_pi.py (so the real
+# capability probes run), emulates `pi install npm:<pkg>` by recording it and
+# writing the package reference into the pi agent settings, and answers
+# print-mode turns with a tiny python helper.
+#
+# Env knobs for tests:
+#   FAKE_PI_NO_AGENT=1     --help omits --agent (no pi-open-agents anywhere)
+#   FAKE_PI_NO_SETTINGS=1  `pi install` records the call but does NOT write
+#                          settings.json (simulates a custom pi setup)
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${FAKE_PI_PYTHON:-python3}"
+FAKE_AGENT="$HERE/fake_agent.py"
+if [ ! -f "$FAKE_AGENT" ]; then FAKE_AGENT="$HERE/../fake_agent.py"; fi
+
+case "${1:-}" in
+  --version) echo "fake-pi 0.0.0" ;;
+  --help)
+    out=$(printf '%s\n' \
+      'pi 0.0.0-fake (test harness)' '' \
+      'Usage:' \
+      '  pi [options] [prompt]' '' \
+      'Options:' \
+      '  --print                    non-interactive print mode' \
+      '  --agent <value>            default agent to use at startup' \
+      '  --session-id <id>          explicit session id' \
+      '  --session-dir <dir>        session store directory' \
+      '  install <source>           install an extension package')
+    if [ "${FAKE_PI_NO_AGENT:-0}" = 1 ]; then
+      printf '%s\n' "$out" | grep -v -- '--agent'
+    else
+      printf '%s\n' "$out"
+    fi
+    exit 0 ;;
+  install)
+    # `pi install npm:pi-open-agents` -> record + register in settings
+    echo "install $*" >> "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/installs.log"
+    pkg="${2#npm:}"
+    dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    if [ "${FAKE_PI_NO_SETTINGS:-0}" != 1 ]; then
+      "$PY" - "$dir/settings.json" "$pkg" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True)
+d = {}
+if p.is_file():
+    d = json.loads(p.read_text() or "{}")
+pk = d.setdefault("packages", [])
+if sys.argv[2] not in pk:
+    pk.append("npm:" + sys.argv[2])
+p.write_text(json.dumps(d, indent=2))
+PY
+    fi
+    echo "installed $2"
+    exit 0 ;;
+  --print|"")
+    exec "$PY" "$FAKE_AGENT" "$@" ;;
+  *)
+    # a print-mode turn without an explicit --print leading arg
+    exec "$PY" "$FAKE_AGENT" "$@" ;;
+esac

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Fake `hermes` CLI for installer e2e tests. Records every call to
+# $HERMES_HOME/calls.log and keeps plugin-enable state in files.
+set -u
+HH="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HH"
+echo "hermes $*" >> "$HH/calls.log"
+case "${1:-}" in
+  plugins)
+    case "${2:-}" in
+      enable)  mkdir -p "$HH/plugins/$3"; touch "$HH/enabled_$3"; echo "enabled $3" ;;
+      disable) rm -f "$HH/enabled_$3"; echo "disabled ${3:-}" ;;
+      remove)  rm -rf "$HH/plugins/$3"; rm -f "$HH/enabled_$3"; echo "removed ${3:-}" ;;
+      list)    ls "${HH}/plugins" 2>/dev/null ;;
+      *)       : ;;
+    esac ;;
+  gateway)
+    case "${2:-}" in
+      restart) echo "restarting" >> "$HH/gateway_restart.log" ;;
+      *)       : ;;
+    esac ;;
+  --version|version) echo "fake-hermes 0.0.0" ;;
+  *) : ;;
+esac
+exit 0
