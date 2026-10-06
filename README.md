@@ -50,7 +50,7 @@ User ──▶ Hermes ──▶ pi_delegate ──▶ bridge runner (systemd, du
 ## Install
 
 ```bash
-git clone <this-repo> pi-hermes-bridge
+git clone https://github.com/motolight/pi-hermes-bridge.git
 cd pi-hermes-bridge
 ./install.sh
 ```
@@ -123,8 +123,14 @@ python -m pytest tests/ -q             # 71 tests, fake pi / fake PI WEB / fake 
 ```bash
 hermes plugins disable pi-worker
 hermes plugins remove pi-worker        # or: rm -rf ~/.hermes/plugins/pi-worker
-./uninstall.sh                         # removes venv + CLI symlink + bridge state (asks first)
+./uninstall.sh                         # asks first
 ```
+
+`uninstall.sh` disables and removes the Hermes plugin `pi-worker`, removes the
+CLI symlink `~/.local/bin/pi-bridge`, and — only on request — deletes the bridge
+state under `${PI_BRIDGE_HOME:-~/.local/state/pi-bridge}`. It does **not** delete
+the checkout (including its `.venv`); if you ask it to, it only prints the
+`rm -rf` command for you to run yourself.
 
 Hermes, Pi, pi-open-agents and PI WEB are left untouched.
 
