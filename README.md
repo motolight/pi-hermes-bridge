@@ -1,15 +1,45 @@
 # pi-hermes-bridge
 
-Durable delegation bridge between [Hermes Agent](https://hermes-agent.nousresearch.com)
-and [Pi Coding Agent](https://github.com/earendil-works/pi).
+**Let Hermes manage the job while Pi does the heavy coding work in the background.**
 
-Hermes stays the user-facing agent. When a substantial coding / DevOps / scripting /
-infrastructure task comes up, Hermes delegates it as a single job to the **Pi
-orchestrator**, which runs detached, durably, and decides on its own whether to use
-its subagents. When the Pi turn finishes, the bridge *wakes* Hermes, which runs an
-independent acceptance check and either reports the result to the user or sends
-feedback back into the **same Pi session** for repair. The user never has to poll
-"so what happened?" and never carries job ids around.
+If Hermes is your main assistant, this bridge lets it hand substantial coding,
+DevOps, scripting and infrastructure work to a **Pi orchestrator**, then wake back
+up when Pi is done, review the result independently, and continue the **same Pi
+session** if something still needs fixing.
+
+## Why use this?
+
+- **Potentially save money on hosted models.** Keep Hermes on the stronger or more
+  expensive model you prefer for planning, conversation and review, while Pi does
+  implementation on a cheaper model. The bridge does not require both agents to
+  use the same provider or model.
+- **Potentially speed up local-model workflows.** Long implementation jobs run in
+  the background instead of blocking the Hermes conversation, and Pi can use its
+  own explorer / worker / reviewer subagents in parallel or as a pipeline.
+- **Keep Hermes as the manager.** Hermes owns the user conversation, context,
+  constraints and acceptance criteria; Pi owns implementation details.
+- **Keep an independent acceptance loop.** When Pi finishes, Hermes wakes up,
+  checks the actual result, and can send concrete feedback back into the same Pi
+  session for another repair turn.
+- **Stop babysitting long jobs.** Jobs are durable, survive gateway interruptions,
+  can be recovered with `pi_list`, and do not require the user to keep asking
+  "is it done yet?"
+- **Use different models for different roles.** This is especially useful if you
+  self-host models and want to reserve the strongest model for orchestration, or
+  if you pay per token and want implementation work to run somewhere cheaper.
+
+In short:
+
+**Hermes = manager / user interface / acceptance reviewer**  
+**Pi = implementation team**  
+**pi-hermes-bridge = the glue between them**
+
+It does **not** magically make every workload faster or cheaper: that depends on
+your model choices, hardware, prompts and subagent setup. The point is that it
+makes those trade-offs possible without turning the user into the message bus
+between two agents.
+
+## How it works
 
 ```
 User ──▶ Hermes ──▶ pi_delegate ──▶ bridge runner (systemd, durable)
