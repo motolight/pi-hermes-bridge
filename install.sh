@@ -15,6 +15,8 @@
 # Flags/env:
 #   --yes / PI_BRIDGE_YES=1     non-interactive, answer yes to offers
 #   --no-restart                skip the controlled `hermes gateway restart`
+#   --allow-non-loopback-webhook  deliberately add the route to a webhook
+#                               platform bound beyond loopback (not recommended)
 #   PI_BRIDGE_PYTHON=python3    python interpreter for the venv
 #   PI_BRIDGE_PI_BIN=/path/pi   explicit pi binary
 #   PI_BRIDGE_WAKE_PORT=8644    wake webhook port (existing platform port wins)
@@ -33,11 +35,13 @@ ask(){
 }
 
 NO_RESTART=0
+NON_LOOPBACK=""
 for a in "$@"; do
   case "$a" in
     --yes|-y) ASK_YES=1 ;;
     --no-restart) NO_RESTART=1 ;;
-    --help|-h) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --allow-non-loopback-webhook) NON_LOOPBACK=1 ;;
+    --help|-h) sed -n "2,30p" "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown flag: $a (try --help)" ;;
   esac
 done
@@ -245,10 +249,11 @@ SKILL_RES=$(hs skill-install) || warn "skill install failed: $SKILL_RES"
 SKILL_ACTION=$(printf '%s' "$SKILL_RES" | jget skill)
 printf 'pi-routing-policy skill: %s\n' "$SKILL_ACTION"
 case "$SKILL_ACTION" in created|updated) CHANGED=1 ;; esac
-
 # ---------------------------------------------------------------------------
 say "7/8 completion wake channel (webhook route + wake.json)"
-ROUTE_RES=$(hs route-install --port "$WAKE_PORT" --json) \
+WAKE_BROKEN=0
+ROUTE_RES=$(hs route-install --port "$WAKE_PORT" --json \
+             ${NON_LOOPBACK:+--allow-non-loopback-webhook}) \
   || die "could not configure the wake webhook route in ~/.hermes/config.yaml:
 $ROUTE_RES
 The route was NOT added and other Hermes settings are untouched; anything
@@ -259,60 +264,86 @@ printf 'webhook route pi-bridge-complete: %s (port %s, bind 127.0.0.1, deliver=l
 case "$ROUTE_ACTION" in created_route|updated_route|created_platform_and_route) CHANGED=1 ;; esac
 [ "$ROUTE_ACTION" = "kept_manual" ] && printf 'NOTE: a pre-existing manual pi-bridge-complete route was found and LEFT UNTOUCHED (no duplicate created). Its prompt may be an older revision — review it against docs/WAKE_SETUP.md if wakes behave unexpectedly.\n'
 WAKE_RES=$(hs wake-write --port "$WAKE_PORT" --json) \
-  || die "wake.json could not be written: $WAKE_RES"
+  || die "wake.json could not be written: $WAKE_RES
+The wake channel is NOT configured; earlier steps of this run may already be
+applied — ./uninstall.sh removes them."
 WAKE_ACTION=$(printf '%s' "$WAKE_RES" | jget wake_json)
 printf 'wake.json: %s\n' "$WAKE_ACTION"
-# never claim 'ready' with a wake channel that cannot authenticate: a foreign
-# wake.json that disagrees with the route we just wrote would 401 forever
+# never claim 'ready' with a wake channel that cannot actually deliver: a
+# foreign wake.json must agree with the configured route (url + secret) and
+# be enabled — otherwise every wake would 401 or silently never fire
 if [ "$WAKE_ACTION" = "kept_existing" ]; then
-  "$BRIDGE_PY" - <<'PY' || die "existing ${PI_BRIDGE_HOME:-$HOME/.local/state/pi-bridge}/wake.json was not created by this installer AND does not match the configured route (url/secret) — wakes would silently fail with 401. Nothing was changed: review that file (or delete it) and re-run ./install.sh to let the installer manage the wake channel."
+  VERIFY=$("$BRIDGE_PY" - <<'PY'
 import json, sys
 from pi_bridge import hermes_setup as h
+st = h.load_state().get("wake", {})
 try:
     d = json.loads(h.wake_json_path().read_text())
-    sec, _ = h.route_secret_in_config()
-    owned = bool(h.load_state().get("wake", {}).get("route_owned"))
-    ok = (not owned) or (d.get("url") == h.wake_url(int(h.load_state()["wake"].get("port", 8644)))
-                         and d.get("secret") and d.get("secret") == sec)
 except Exception:
-    ok = False
-sys.exit(0 if ok else 1)
+    print("corrupt"); sys.exit()
+sec, _ = h.route_secret_in_config()
+port = int(st.get("port", 8644))
+url_ok = d.get("url") in (h.wake_url(port), h.wake_url(port, str(st.get("url_host", "127.0.0.1"))))
+sec_ok = bool(d.get("secret")) and d.get("secret") == sec
+if d.get("enabled") is not True: print("disabled")
+elif not url_ok: print("url")
+elif not sec_ok: print("secret")
+else: print("ok")
 PY
+)
+  if [ "$VERIFY" != "ok" ]; then
+    if [ "$ROUTE_ACTION" = "kept_manual" ]; then
+      printf 'WARNING: the existing manual wake.json does not match the manual route (%s) — wakes may not arrive. Review it against docs/WAKE_SETUP.md; nothing was changed.\n' "$VERIFY"
+      WAKE_BROKEN=1
+    else
+      die "existing ${PI_BRIDGE_HOME:-$HOME/.local/state/pi-bridge}/wake.json was not created by this installer AND does not match the configured route (problem: $VERIFY) — wakes would silently fail. Nothing further was changed: review that file (or delete it) and re-run ./install.sh to let the installer manage the wake channel. Earlier steps of this run remain installed; ./uninstall.sh removes them."
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------------------
 say "8/8 apply + verify (controlled gateway restart)"
 GATEWAY_NOTE="the bridge config is applied when the gateway (re)starts"
+GATEWAY_RUNNING=0
 if [ "$NO_RESTART" = 1 ]; then
   printf 'Skipped restart (--no-restart). Apply changes when convenient: hermes gateway restart\n'
 elif [ "$CHANGED" != 1 ]; then
   printf 'Nothing changed since the previous install — no gateway restart needed.\n'
   GATEWAY_NOTE="nothing changed; no restart performed"
-elif pgrep -u "$("$BRIDGE_PY" -c 'import os;print(os.getuid())')" -f "hermes.*gateway" >/dev/null 2>&1; then
-  printf 'A hermes gateway is running -> hermes gateway restart (one controlled restart, required to load the plugin + static route)\n'
-  if hermes gateway restart >/dev/null 2>&1; then
-    UP=0
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-      if "$BRIDGE_PY" - "$WAKE_PORT" <<'PY' 2>/dev/null
+else
+  # strict-ish liveness: prefer the official status command, fall back to a
+  # narrow process pattern (never the loose 'hermes.*gateway' — it matches
+  # unrelated command lines)
+  if hermes gateway status 2>/dev/null | grep -qE "Active: active \(running\)" \
+     || pgrep -u "$(id -u)" -f "hermes gateway" >/dev/null 2>&1; then
+    GATEWAY_RUNNING=1
+  fi
+  if [ "$GATEWAY_RUNNING" = 1 ]; then
+    printf 'A hermes gateway is running -> hermes gateway restart (one controlled restart, required to load the plugin + static route)\n'
+    if hermes gateway restart >/dev/null 2>&1; then
+      UP=0
+      for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if "$BRIDGE_PY" - "$WAKE_PORT" <<'PY' 2>/dev/null
 import socket, sys
 s = socket.socket(); s.settimeout(0.5)
 sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)
 PY
-      then UP=1; break; fi
-      sleep 2
-    done
-    if [ "$UP" = 1 ]; then
-      GATEWAY_NOTE="gateway restarted, webhook port $WAKE_PORT listening"
+        then UP=1; break; fi
+        sleep 2
+      done
+      if [ "$UP" = 1 ]; then
+        GATEWAY_NOTE="gateway restarted, webhook port $WAKE_PORT listening"
+      else
+        warn "gateway restarted but the webhook port is not answering yet; check: hermes gateway status / journalctl --user -u hermes-gateway -n 40"
+        GATEWAY_NOTE="gateway restart issued; webhook port NOT verified yet — check 'hermes gateway status'"
+      fi
     else
-      warn "gateway restarted but the webhook port is not answering yet; check: hermes gateway status / journalctl --user -u hermes-gateway -n 40"
-      GATEWAY_NOTE="gateway restart issued; webhook port NOT verified yet — check 'hermes gateway status'"
+      warn "'hermes gateway restart' failed; apply manually: hermes gateway restart"
+      GATEWAY_NOTE="gateway restart FAILED — run 'hermes gateway restart' yourself"
     fi
   else
-    warn "'hermes gateway restart' failed; apply manually: hermes gateway restart"
-    GATEWAY_NOTE="gateway restart FAILED — run 'hermes gateway restart' yourself"
+    printf 'No running hermes gateway detected — nothing to restart; new config applies on first start.\n'
   fi
-else
-  printf 'No running hermes gateway detected — nothing to restart; new config applies on first start.\n'
 fi
 
 # ---------------------------------------------------------------------------
@@ -335,8 +366,8 @@ Summary:
   * completion wake: route '$ROUTE_ACTION' on 127.0.0.1:$WAKE_PORT, wake.json $(printf '%s' "$WAKE_RES" | jget wake_json)
   * gateway: $GATEWAY_NOTE
 EOF
-if [ "$ORCH_PROBE" = 1 ]; then
+if [ "$ORCH_PROBE" = 1 ] && [ "${WAKE_BROKEN:-0}" != 1 ]; then
   printf '\npi-hermes-bridge is ready. Hermes can now delegate substantial coding/DevOps work to Pi automatically.\n'
 else
-  printf '\npi-hermes-bridge is installed. Finish the NOTE above (Pi model / orchestrator probe), then verify with: pi-bridge list\n'
+  printf '\npi-hermes-bridge is installed, but not fully verified (see NOTEs above). Resolve them, then check with: pi-bridge list\n'
 fi

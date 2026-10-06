@@ -116,8 +116,9 @@ def save_state(st: dict) -> None:
     write_text_atomic(state_path(), json.dumps(st, indent=2, sort_keys=True) + "\n")
 
 
-def wake_url(port: int) -> str:
-    return f"http://127.0.0.1:{int(port)}/webhooks/{ROUTE_NAME}"
+def wake_url(port: int, host: str = "127.0.0.1") -> str:
+    h = {"localhost": "127.0.0.1", "::1": "[::1]"}.get(host, host) or "127.0.0.1"
+    return f"http://{h}:{int(port)}/webhooks/{ROUTE_NAME}"
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +183,20 @@ def install_soul_block(text: str, policy: str = SOUL_POLICY) -> tuple[str, str]:
 
 
 def remove_soul_block(text: str) -> tuple[str, str]:
-    """Remove exactly one managed block (plus the blank line we introduced)."""
+    """Remove exactly one managed block, byte-exactly undoing our insertion
+    (install appends ``\n\n<block>\n`` to the user's rstripped text)."""
     if not soul_block_present(text):
         return text, "absent"
     _soul_markers_safe(text)
     before, rest = text.split(SOUL_BEGIN, 1)
     _, after = rest.split(SOUL_END, 1)
-    new = before.rstrip("\n") + "\n" + after.lstrip("\n")
+    if before.endswith("\n\n"):
+        before = before[:-2]          # the separator we introduced
+    if after.startswith("\n"):
+        after = after[1:]             # the trailing newline we introduced
+    new = before + after
+    if new and not new.endswith("\n"):
+        new += "\n"                   # restore the file-level trailing newline
     if soul_block_present(new):
         raise BridgeError("more than one pi-hermes-bridge managed block found in SOUL.md; "
                           "remove the extra blocks manually")
@@ -228,6 +236,17 @@ def soul_remove_file() -> dict:
 # pi-routing-policy skill (optional, portable)
 # ---------------------------------------------------------------------------
 
+def _tree_equal(a: Path, b: Path) -> bool:
+    """Same file set + contents, ignoring our ownership sentinel."""
+    import filecmp
+    names_a = {p.relative_to(a).as_posix() for p in a.rglob("*") if p.is_file()}
+    names_b = {p.relative_to(b).as_posix() for p in b.rglob("*")
+               if p.is_file() and p.name != ".pi-hermes-bridge"}
+    if names_a != names_b:
+        return False
+    return all(filecmp.cmp(a / n, b / n, shallow=False) for n in names_a)
+
+
 def skill_source_dir(repo_root: Path) -> Path:
     return repo_root / "skills" / SKILL_NAME
 
@@ -243,6 +262,10 @@ def skill_install_file(repo_root: Path) -> dict:
         if not ours:
             return {"skill": "skipped",
                     "skill_reason": f"{dst} exists and was not created by pi-hermes-bridge"}
+        if _tree_equal(src, dst):
+            st["skill_installed"] = True
+            save_state(st)
+            return {"skill": "unchanged", "skill_backup": None}
         action = "updated"
     else:
         action = "created"
@@ -369,6 +392,7 @@ def route_install(secret: str, port: int = DEFAULT_PORT,
         created_platform = True
         owned_keys = ["host", "port", "secret"]
         action = "created_platform_and_route"
+        host = "127.0.0.1"
     else:
         created_platform = bool(wake.get("platform_created_by_us")) and \
             str(hermes_home()) == wake.get("hermes_home", str(hermes_home()))
@@ -382,14 +406,15 @@ def route_install(secret: str, port: int = DEFAULT_PORT,
         if routes_raw is not None and not isinstance(routes_raw, dict):
             raise BridgeError("'platforms.webhook.extra.routes' is not a mapping; cannot safely edit it.")
         routes = _ensure_key(extra, "routes", lambda: y.Map())
+        if not isinstance(routes, dict):
+            raise BridgeError("'platforms.webhook.extra.routes' is not a mapping; cannot safely edit it.")
         # A missing `host` means Hermes binds ALL interfaces (webhook.py
         # DEFAULT_HOST=None) -> that is NOT loopback; only our own created
         # platform may be pinned to loopback here.
         host_raw = extra.get("host", None)
-        if host_raw is None and created_platform:
+        if host_raw is None and created_platform and "host" not in owned_keys:
             extra["host"] = "127.0.0.1"
-            if "host" not in owned_keys:
-                owned_keys.append("host")
+            owned_keys.append("host")
             host = "127.0.0.1"
         else:
             host = str(host_raw if host_raw is not None else "")
@@ -420,19 +445,19 @@ def route_install(secret: str, port: int = DEFAULT_PORT,
         else:
             action = "created_route"
             routes[ROUTE_NAME] = _cm(y, build_route(secret, toolsets, prompt))
-            if "port" not in extra:
-                extra["port"] = int(port)
-                if created_platform:
+            # NEVER pin host/port on a foreign platform (that would move the
+            # user's whole listener); only our own platform gets our defaults.
+            if created_platform:
+                if "port" not in extra:
+                    extra["port"] = int(port)
                     owned_keys.append("port")
-            if created_platform and "secret" not in extra:
-                extra["secret"] = secret
-                owned_keys.append("secret")
+                if "secret" not in extra:
+                    extra["secret"] = secret
+                    owned_keys.append("secret")
         enabled_now = bool(wh.get("enabled", False))
         if not enabled_now:
-            if created_platform or wake.get("we_enabled_platform"):
+            if created_platform:
                 wh["enabled"] = True
-                wake["we_enabled_platform"] = True
-                wake.setdefault("platform_was_enabled", False)
             else:
                 raise BridgeError(
                     "platforms.webhook exists but is disabled and was not created "
@@ -440,10 +465,20 @@ def route_install(secret: str, port: int = DEFAULT_PORT,
                     "platform. Enable it yourself (platforms.webhook.enabled: true) "
                     "or bind a dedicated bridge setup.")
         port = int(extra.get("port", DEFAULT_PORT))
+    # URL host the bridge will call: must match where the gateway actually
+    # binds (a '::1'-only or 'localhost'-bound platform is NOT reachable via
+    # a hardcoded 127.0.0.1 URL).
+    url_host = {"localhost": "127.0.0.1", "::1": "[::1]", "": "127.0.0.1"}.get(
+        host if action != "created_platform_and_route" else "127.0.0.1", "127.0.0.1")
     restart_needed = True
 
-    backup_file(cfg_path)
-    write_preserving_mode(cfg_path, y._dumps(doc))
+    new_text = y._dumps(doc)
+    if cfg_path.is_file() and cfg_path.read_text(encoding="utf-8") == new_text:
+        action = "unchanged"
+        restart_needed = False
+    else:
+        backup_file(cfg_path)
+        write_preserving_mode(cfg_path, new_text)
 
     wake.update({
         "route_owned": True,
@@ -452,11 +487,12 @@ def route_install(secret: str, port: int = DEFAULT_PORT,
         "owned_platform_keys": sorted(set(owned_keys)),
         "hermes_home": str(hermes_home()),
         "port": port,
+        "url_host": url_host,
     })
     st["wake"] = wake
     save_state(st)
     return {"route": action, "restart_needed": restart_needed, "port": port,
-            "route_secret": secret}
+            "url_host": url_host, "route_secret": secret}
 
 
 def route_remove() -> dict:
@@ -503,7 +539,7 @@ def route_remove() -> dict:
             wh.pop("extra", None)
         # only collapse the whole platform when NOTHING foreign remains in it
         # (not even a key the user added by hand later)
-        if len(wh) == 1 and "enabled" in wh and not wake.get("platform_was_enabled"):
+        if len(wh) == 1 and "enabled" in wh:
             platforms.pop("webhook")
             if len(platforms) == 0:
                 doc.pop("platforms", None)
@@ -537,7 +573,8 @@ def route_secret_in_config() -> tuple[str, int | None]:
         return "", None
 
 
-def wake_write(secret: str, port: int, force: bool = False) -> dict:
+def wake_write(secret: str, port: int, force: bool = False,
+               url_host: str = "127.0.0.1") -> dict:
     """Create/update bridge wake.json (0600).  A pre-existing wake.json we do
     not own (manual v0.1 setup) is never rewritten unless force=True."""
     p = wake_json_path()
@@ -547,7 +584,7 @@ def wake_write(secret: str, port: int, force: bool = False) -> dict:
         return {"wake_json": "kept_existing",
                 "wake_json_reason": "pre-existing wake.json left untouched"}
     p.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"enabled": True, "url": wake_url(port), "secret": secret}
+    payload = {"enabled": True, "url": wake_url(port, url_host), "secret": secret}
     write_text_atomic(p, json.dumps(payload, indent=2) + "\n")
     os.chmod(p, 0o600)
     wake["wake_json_owned"] = True

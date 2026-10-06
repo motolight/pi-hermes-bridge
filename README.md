@@ -121,7 +121,9 @@ normal path.** Concretely, `install.sh`:
 Every change is owned and idempotent: run `./install.sh` as often as you
 like; `./uninstall.sh` removes exactly the pieces above and nothing else.
 Useful flags: `--yes` (non-interactive), `--no-restart` (skip the gateway
-restart), env overrides in `./install.sh --help`.
+restart), `--allow-non-loopback-webhook` (only if you deliberately expose the
+Hermes webhook platform beyond loopback — not recommended), env overrides in
+`./install.sh --help`.
 
 
 ## Tools exposed to Hermes
@@ -191,7 +193,8 @@ routing block (your other SOUL text survives), the `pi-routing-policy` skill
 (foreign routes/settings survive; a pre-existing manual route is left alone),
 `wake.json`, the `pi-worker` plugin and the `~/.local/bin/pi-bridge` symlink.
 Job state under `${PI_BRIDGE_HOME:-~/.local/state/pi-bridge}` is deleted only
-after an explicit `y`. It does **not** delete the checkout (including its
+after you literally type `DELETE` at the prompt (never auto-confirmed, even in
+non-interactive mode). It does **not** delete the checkout (including its
 `.venv`); if you ask it to, it only prints the `rm -rf` command for you to run
 yourself.
 

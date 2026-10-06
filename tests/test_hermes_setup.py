@@ -134,9 +134,11 @@ def test_route_into_existing_platform_preserves_everything(sb):
     assert set(routes) == {"other-team-route", "pi-bridge-complete"}
     assert routes["other-team-route"]["secret"] == "foreign-secret"
     assert doc["platforms"]["webhook"]["extra"]["secret"] == "foreign-global"
-    # update path keeps single route, refreshes prompt
-    r2 = hs.route_install("sec2")
+    # update path keeps single route; a byte-identical re-install is 'unchanged'
+    r2 = hs.route_install("s2")   # same secret? no: different secret -> updated
     assert r2["route"] == "updated_route"
+    r3 = hs.route_install("s2")
+    assert r3["route"] == "unchanged"
     doc2 = _read_cfg()
     assert set(doc2["platforms"]["webhook"]["extra"]["routes"]) == set(routes)
 
@@ -248,6 +250,9 @@ def test_skill_lifecycle(sb):
     (repo / "skills" / hs.SKILL_NAME / "SKILL.md").write_text("skill body\n")
     assert hs.skill_install_file(repo)["skill"] == "created"
     assert (hs.skills_dir() / hs.SKILL_NAME / "SKILL.md").is_file()
+    assert hs.skill_install_file(repo)["skill"] == "unchanged"
+    # real content change -> updated, with a one-time tar backup of our own copy
+    (repo / "skills" / hs.SKILL_NAME / "SKILL.md").write_text("new body\n")
     assert hs.skill_install_file(repo)["skill"] == "updated"
     # foreign skill dir with the same name is never overwritten
     import shutil
@@ -265,6 +270,52 @@ def test_skill_lifecycle(sb):
 
 
 # ------------------------------------------------------------------- state
+
+def test_soul_removal_is_byte_exact_at_eof(sb):
+    p = hs.soul_path()
+    original = "You are Hermes.\nline two\n"
+    p.write_text(original)
+    hs.soul_install_file()
+    hs.soul_remove_file()
+    assert p.read_text() == original  # byte-for-byte roundtrip
+
+
+def test_soul_removal_sole_block_leaves_clean_file(sb):
+    # install on a missing file, remove -> nothing but an empty file, no markers
+    hs.soul_install_file()
+    hs.soul_remove_file()
+    assert hs.SOUL_BEGIN not in hs.soul_path().read_text()
+
+
+def test_wake_url_respects_bound_host():
+    assert hs.wake_url(8644) == "http://127.0.0.1:8644/webhooks/pi-bridge-complete"
+    assert hs.wake_url(8644, "::1") == "http://[::1]:8644/webhooks/pi-bridge-complete"
+    assert hs.wake_url(8644, "localhost") == "http://127.0.0.1:8644/webhooks/pi-bridge-complete"
+
+
+def test_route_reinstall_reports_unchanged(sb):
+    hs.route_install("s", port=8644)
+    first = hs.config_path().read_text()
+    r = hs.route_install("s", port=8644)
+    assert r["route"] == "unchanged"
+    assert r["restart_needed"] is False
+    assert hs.config_path().read_text() == first
+
+
+def test_route_never_pins_port_on_foreign_platform(sb):
+    hs.config_path().write_text("""\
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      routes: {}
+""")
+    r = hs.route_install("s", port=9999)   # bridge default port 9999
+    assert r["route"] == "created_route"
+    assert r["port"] == 8644               # adopts the platform default, does NOT write 9999
+    assert "9999" not in hs.config_path().read_text()
+
 
 def test_state_secret_redacted_in_cli(sb):
     from pi_bridge import cli

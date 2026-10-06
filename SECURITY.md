@@ -75,11 +75,21 @@ Keep the route loopback-only, keep the secret strong
   (removing only owned changes) rather than rolling a stale backup over
   newer edits.
 - **Loopback guard.** The installer refuses to add the toolset-granting wake
-  route to a webhook platform bound to a non-loopback address unless you
-  explicitly pass `--allow-non-loopback-webhook`.
+  route to a webhook platform bound to a non-loopback address (a missing
+  `host` counts as non-loopback, because that is how Hermes binds all
+  interfaces) unless you explicitly pass `--allow-non-loopback-webhook`.
 - **YAML safety.** `config.yaml` is edited round-trip (ruamel), preserving
   comments, ordering and unrelated sections; a fresh secret is generated once
   and reused on re-runs instead of desynchronising route/wake secrets.
+
+- **Trust model of the created orchestrator.** If you let the installer
+  create the minimal `orchestrator.md`, its frontmatter includes
+  `permission: {"*": allow}`: delegated Pi jobs run unattended (nobody is
+  watching an agent woken at 3 a.m.), so the file is created with
+  auto-approval *and shown to you before the yes prompt* — edit it afterwards
+  to whatever permission policy you want. The bridge itself still adds no
+  privilege beyond what running `pi` interactively in your account already
+  has.
 
 ## Reporting
 

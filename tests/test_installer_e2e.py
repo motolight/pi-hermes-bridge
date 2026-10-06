@@ -268,7 +268,7 @@ def test_install_refuses_foreign_wake_json_that_cannot_authenticate(sandbox):
     r = sandbox.install()
     assert r.returncode != 0
     out = r.stdout + r.stderr
-    assert "wake" in out and "401" in out
+    assert "wake.json" in out and "problem" in out
     assert "pi-hermes-bridge is ready" not in out
     # the foreign wake.json was left exactly as-is for the operator to review
     assert "stale" in sandbox.wake.read_text()
@@ -298,6 +298,43 @@ def test_install_then_uninstall_roundtrip(sandbox):
     calls = (sandbox.hermes / "calls.log").read_text()
     assert "plugins disable pi-worker" in calls and "plugins remove pi-worker" in calls
     assert soul_user is not None
+
+
+def test_second_install_performs_no_gateway_restart(sandbox):
+    # fake hermes reports the gateway as running; first install must restart
+    # exactly once, a no-op re-install must NOT restart again (requirement §5:
+    # one controlled restart *if needed*)
+    sandbox.seed_soul()
+    sandbox.seed_cfg()
+    assert sandbox.install().returncode == 0
+    log = sandbox.hermes / "gateway_restart.log"
+    assert log.exists() and len(log.read_text().splitlines()) == 1
+    r2 = sandbox.install()
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "no gateway restart needed" in r2.stdout
+    assert len(log.read_text().splitlines()) == 1
+
+
+def test_manual_upgrade_disabled_wake_json_warns_not_ready(sandbox):
+    # v0.1 manual route + a disabled wake.json matching it: the installer must
+    # not silently claim 'ready' (wakes would never fire)
+    sandbox.seed_cfg()
+    sandbox.cfg.write_text(sandbox.cfg.read_text() + """\
+        pi-bridge-complete:
+          secret: manual-v01-secret
+          events: [pi_bridge_turn_complete]
+          deliver: log
+""")
+    sandbox.wake.write_text(json.dumps(
+        {"enabled": False,
+         "url": "http://127.0.0.1:8644/webhooks/pi-bridge-complete",
+         "secret": "manual-v01-secret"}))
+    r = sandbox.install()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "is ready" not in r.stdout
+    assert "does not match the manual route" in r.stdout
+    # nothing changed about the operator's file
+    assert json.loads(sandbox.wake.read_text())["enabled"] is False
 
 
 # --------------------------------------------------- route prompt content

@@ -17,14 +17,18 @@ same, because the bridge never inspects or steers subagents.
     └── reviewer.md          # independent acceptance check
 ```
 
-`agents/orchestrator.md` frontmatter (body = your orchestrator prompt):
+`agents/orchestrator.md` frontmatter (body = your orchestrator prompt; this is
+also the shape `install.sh` creates — it omits the `model:` line so pi uses
+your current/default model, and adds an optional `permission:` block that you
+can tighten afterwards):
 
 ```markdown
 ---
 name: orchestrator
 tools: read, bash, edit, write, grep, find, ls
-model: <any model you run — local vLLM, hosted, etc.>
+model: <any model you run — local vLLM, hosted, etc.>   # omit to use pi's default
 thinking: medium
+mode: primary
 allowedAgents: explorer, worker, reviewer
 ---
 You are the orchestrator. Decompose the goal, delegate to subagents as you see

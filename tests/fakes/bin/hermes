@@ -17,6 +17,7 @@ case "${1:-}" in
   gateway)
     case "${2:-}" in
       restart) echo "restarting" >> "$HH/gateway_restart.log" ;;
+      status)  printf '\u25cf hermes-gateway.service\n     Active: active (running) fake\n' ;;
       *)       : ;;
     esac ;;
   --version|version) echo "fake-hermes 0.0.0" ;;

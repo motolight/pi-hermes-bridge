@@ -208,7 +208,8 @@ def main(argv=None) -> int:
                 if not secret:
                     raise BridgeError("no wake secret: pass --secret or run route-install first")
                 port = port or int(st.get("wake", {}).get("port") or hsetup.DEFAULT_PORT)
-                res = hsetup.wake_write(secret, port, force=args.force)
+                url_host = str(st.get("wake", {}).get("url_host") or "127.0.0.1")
+                res = hsetup.wake_write(secret, port, force=args.force, url_host=url_host)
             elif args.hs_cmd == "wake-disable":
                 res = hsetup.wake_disable(remove=not args.keep)
             elif args.hs_cmd == "state":
