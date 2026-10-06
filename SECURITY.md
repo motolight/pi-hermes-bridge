@@ -16,8 +16,11 @@
   the timestamp bound into the signature and a ±300 s freshness window
   (replay-protected), enforced per route. A missing/invalid signature is rejected.
 - The secret lives in `~/.hermes/config.yaml` and `$PI_BRIDGE_HOME/wake.json`
-  (mode 0600). It is never stored in job state, never returned by `pi_status`/
-  `pi_list`, never logged by the runner.
+  (mode 0600); the guided installer also records it in
+  `$PI_BRIDGE_HOME/hermes_setup.json` (ownership state, same directory —
+  protect it like your Hermes config). It is never stored in job state, never
+  returned by `pi_status`/`pi_list`, never logged by the runner, and never
+  printed by the CLI (`hermes-setup state` redacts it).
 - Idempotency: a constant `X-Request-ID` per (job, turn) is cached for one hour,
   so retries cannot start duplicate agent runs.
 - The woken run treats `final_result_excerpt` as **untrusted data**, never as
@@ -52,6 +55,31 @@ to the woken agent run — that is the deliberate, security-relevant decision.
 Keep the route loopback-only, keep the secret strong
 (`python3 -c "import secrets;print(secrets.token_urlsafe(32))"`), and scope
 `toolsets` to the minimum your acceptance checks need.
+
+## Guided installer (v0.2)
+
+- **No software installation of agents.** The installer never installs or
+  updates Hermes, Pi or PI WEB; a missing prerequisite stops the run with the
+  official project URL. `pi-open-agents` is only installed after an explicit
+  yes, through pi's own `pi install npm:…` mechanism (no sudo, no system
+  packages).
+- **Ownership model.** Everything the installer changes in your Hermes home is
+  marker- or route-scoped and recorded in `$PI_BRIDGE_HOME/hermes_setup.json`:
+  the SOUL.md block between `pi-hermes-bridge:begin/end` markers, the
+  `pi-bridge-complete` route, the `pi-routing-policy` skill, the plugin, the
+  CLI symlink. Foreign content (other SOUL text, other webhook routes and
+  platform settings, a manual pre-existing bridge route, foreign skills) is
+  detected and left untouched — on install, on update and on uninstall.
+- **Backups, never restores.** Each first modification leaves a one-time
+  `<file>.pi-hermes-bridge.bak` beside the file; uninstall edits in place
+  (removing only owned changes) rather than rolling a stale backup over
+  newer edits.
+- **Loopback guard.** The installer refuses to add the toolset-granting wake
+  route to a webhook platform bound to a non-loopback address unless you
+  explicitly pass `--allow-non-loopback-webhook`.
+- **YAML safety.** `config.yaml` is edited round-trip (ruamel), preserving
+  comments, ordering and unrelated sections; a fresh secret is generated once
+  and reused on re-runs instead of desynchronising route/wake secrets.
 
 ## Reporting
 

@@ -1,9 +1,16 @@
-# Wake channel setup (operator runbook, V1.3)
+# Wake channel setup (manual fallback / troubleshooting runbook, V1.3)
 
-**Who runs this:** the Hermes orchestrator (a human-adjacent operator role).
-The pi-bridge side ships the code and this runbook only — it never edits
-Hermes `config.yaml`, never installs the plugin and never restarts the
-gateway.
+> **Since v0.2 you normally do NOT need this file:** `./install.sh` performs
+> every step below automatically (secret, route in `config.yaml`,
+> `wake.json`, controlled gateway restart), idempotently and with ownership
+> tracking so `uninstall.sh` can undo exactly those changes. Use this runbook
+> only to (a) understand what the installer did, (b) set the channel up by
+> hand when the installer cannot edit your Hermes config, or (c) debug wakes.
+
+**Who runs this (fallback):** the Hermes orchestrator (a human-adjacent operator role).
+The pi-bridge side ships the code and this runbook — the manual path never edits
+Hermes `config.yaml` for you; the guided `install.sh` path does, under the
+ownership rules described in the README.
 
 **What it buys:** when a Pi turn ends (`completed` / `failed`), the bridge
 runner POSTs a signed `pi_bridge_turn_complete` event to the Hermes gateway
@@ -97,9 +104,7 @@ platforms:
           toolsets:
             - hermes-webhook
             - pi_bridge          # toolset registered by the pi-worker plugin
-          deliver: telegram      # or discord/slack/... ; "log" = log only, user sees nothing
-          deliver_extra:
-            chat_id: "-1001234567890"   # optional; omit to use the platform home channel
+          deliver: log          # V1.3 recommended: the woken run delivers per job origin (see below); a hard-wired messaging target leaks results into the wrong channel
           prompt: |
             Automated Pi-bridge callback (not a user message): job {job_id},
             turn {turn}, status {status}.
@@ -165,7 +170,7 @@ lazily on every POST):
 hermes webhook subscribe pi-bridge-complete \
   --events pi_bridge_turn_complete \
   --secret "$WAKE_SECRET" \
-  --deliver telegram \
+  --deliver log \
   --description "Wake Hermes when a Pi bridge turn completes" \
   --prompt 'Automated Pi-bridge callback: job {job_id} turn {turn} status {status} in {cwd}. Task: {task_preview}. Call pi_status for job_id={job_id}, run the acceptance check in {cwd}, then either report the outcome to the user or send pi_feedback to job_id={job_id} with the findings. Never pi_delegate the same work again; use pi_list if you are unsure.'
 # NB: a STATIC route wins over a dynamic subscription with the same name
