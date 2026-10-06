@@ -90,6 +90,34 @@ def main(argv=None) -> int:
     ins.add_argument("--pi-bin", default="", help="explicit pi path (default: PI_BRIDGE_PI_BIN then PATH)")
     ins.add_argument("--json", action="store_true")
 
+    hs = sub.add_parser("hermes-setup",
+                        help="managed Hermes-side config (SOUL block, routing skill, "
+                             "wake route, wake.json) — used by install.sh/uninstall.sh")
+    hs_sub = hs.add_subparsers(dest="hs_cmd", required=True)
+    hs_sub.add_parser("soul-install", help="insert/update the managed SOUL.md routing block")
+    hs_sub.add_parser("soul-remove", help="remove only the managed SOUL.md block")
+    p = hs_sub.add_parser("skill-install", help="install the pi-routing-policy skill")
+    p.add_argument("--repo-root", default="", help="repo checkout root (default: package parent)")
+    hs_sub.add_parser("skill-remove", help="remove the skill only if we installed it")
+    p = hs_sub.add_parser("route-install", help="insert/update the bridge-owned webhook route")
+    p.add_argument("--secret", default="", help="HMAC secret (default: reuse owned secret or generate)")
+    p.add_argument("--port", type=int, default=0, help="webhook port (default: existing or 8644)")
+    p.add_argument("--allow-non-loopback-webhook", action="store_true",
+                   help="explicitly accept a non-loopback platform bind (NOT recommended)")
+    p.add_argument("--json", action="store_true")
+    p = hs_sub.add_parser("route-remove", help="remove only the bridge-owned route")
+    p.add_argument("--json", action="store_true")
+    p = hs_sub.add_parser("wake-write", help="write bridge wake.json (0600)")
+    p.add_argument("--secret", default="", help="HMAC secret (default: bridge-owned secret)")
+    p.add_argument("--port", type=int, default=0)
+    p.add_argument("--force", action="store_true",
+                   help="overwrite even a wake.json we do not own")
+    p.add_argument("--json", action="store_true")
+    p = hs_sub.add_parser("wake-disable", help="disable (or remove, if owned) wake.json")
+    p.add_argument("--keep", action="store_true", help="disable in place instead of removing")
+    p.add_argument("--json", action="store_true")
+    hs_sub.add_parser("state", help="dump the ownership state (secrets redacted)")
+
     cn = sub.add_parser("cancel", help="cancel a running bridge job")
     cn.add_argument("job_id")
     cn.add_argument("--json", action="store_true")
@@ -142,6 +170,57 @@ def main(argv=None) -> int:
         elif args.cmd == "web-info":
             job = state.load_job(args.job_id)
             print(json.dumps(bridge.piweb_view(job), ensure_ascii=False))
+        elif args.cmd == "hermes-setup":
+            from pathlib import Path as _Path
+            from . import hermes_setup as hsetup
+            res = None
+            if args.hs_cmd == "soul-install":
+                res = hsetup.soul_install_file()
+            elif args.hs_cmd == "soul-remove":
+                res = hsetup.soul_remove_file()
+            elif args.hs_cmd == "skill-install":
+                root = args.repo_root or str(_Path(__file__).resolve().parent.parent)
+                res = hsetup.skill_install_file(_Path(root).expanduser())
+            elif args.hs_cmd == "skill-remove":
+                res = hsetup.skill_remove_file()
+            elif args.hs_cmd == "route-install":
+                st = hsetup.load_state()
+                known = str(st.get("wake", {}).get("secret", ""))
+                secret = args.secret or known or hsetup.generate_secret()
+                res = hsetup.route_install(
+                    secret, port=args.port or hsetup.DEFAULT_PORT,
+                    allow_non_loopback=args.allow_non_loopback_webhook)
+                safe = dict(res)
+                safe.pop("route_secret", None)
+                safe["secret_source"] = "provided" if args.secret else (
+                    "reused" if secret == known else "generated")
+                res = safe
+            elif args.hs_cmd == "route-remove":
+                res = hsetup.route_remove()
+            elif args.hs_cmd == "wake-write":
+                st = hsetup.load_state()
+                secret = args.secret or str(st.get("wake", {}).get("secret", ""))
+                port = args.port
+                if not secret:
+                    # manual v0.1 route: reuse its secret instead of inventing one
+                    secret, cfg_port = hsetup.route_secret_in_config()
+                    port = port or (cfg_port or 0)
+                if not secret:
+                    raise BridgeError("no wake secret: pass --secret or run route-install first")
+                port = port or int(st.get("wake", {}).get("port") or hsetup.DEFAULT_PORT)
+                res = hsetup.wake_write(secret, port, force=args.force)
+            elif args.hs_cmd == "wake-disable":
+                res = hsetup.wake_disable(remove=not args.keep)
+            elif args.hs_cmd == "state":
+                def _redact(x):
+                    if isinstance(x, dict):
+                        return {k: ("<redacted>" if k == "secret" and v else _redact(v))
+                                for k, v in x.items()}
+                    if isinstance(x, list):
+                        return [_redact(v) for v in x]
+                    return x
+                res = _redact(hsetup.load_state())
+            print(json.dumps(res, ensure_ascii=False))
         elif args.cmd == "install":
             import os as _os
             import shutil as _shutil

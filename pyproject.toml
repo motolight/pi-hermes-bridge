@@ -4,9 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pi-bridge"
-version = "0.1.0"
-description = "Durable Hermes->Pi delegation bridge (runner + CLI)"
+version = "0.2.0"
+description = "Durable Hermes->Pi delegation bridge (runner + CLI + guided Hermes-side setup)"
 requires-python = ">=3.10"
+dependencies = [
+    # round-trip YAML editing of ~/.hermes/config.yaml (preserves comments,
+    # ordering and every foreign route/setting). Used only by
+    # pi_bridge/hermes_setup.py; runner/wake paths import nothing.
+    "ruamel.yaml>=0.17",
+]
 
 [project.scripts]
 pi-bridge = "pi_bridge.cli:main"
