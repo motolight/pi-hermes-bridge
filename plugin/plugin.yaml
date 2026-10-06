@@ -1,0 +1,14 @@
+name: pi-worker
+version: 0.3.0
+description: >-
+  Delegate coding tasks to the Pi orchestrator through the durable
+  pi-bridge (pi_delegate / pi_status / pi_feedback / pi_cancel / pi_list),
+  let the bridge wake Hermes itself when a Pi turn completes, and record
+  the requesting session's delivery origin with each job.
+kind: standalone
+provides_tools:
+  - pi_delegate
+  - pi_list
+  - pi_status
+  - pi_feedback
+  - pi_cancel

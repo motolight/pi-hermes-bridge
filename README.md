@@ -1,0 +1,138 @@
+# pi-hermes-bridge
+
+Durable delegation bridge between [Hermes Agent](https://hermes-agent.nousresearch.com)
+and [Pi Coding Agent](https://github.com/earendil-works/pi).
+
+Hermes stays the user-facing agent. When a substantial coding / DevOps / scripting /
+infrastructure task comes up, Hermes delegates it as a single job to the **Pi
+orchestrator**, which runs detached, durably, and decides on its own whether to use
+its subagents. When the Pi turn finishes, the bridge *wakes* Hermes, which runs an
+independent acceptance check and either reports the result to the user or sends
+feedback back into the **same Pi session** for repair. The user never has to poll
+"so what happened?" and never carries job ids around.
+
+```
+User ──▶ Hermes ──▶ pi_delegate ──▶ bridge runner (systemd, durable)
+                                      │  pi --print --agent orchestrator < task
+                                      ▼
+                              Pi orchestrator ──▶ its own subagents
+                                      │  (session store JSONL, append-only)
+                                      ▼
+            turn terminal ──▶ wake event (HMAC webhook) ──▶ Hermes wake run
+                                      │
+                     acceptance check │ fail → pi_feedback (SAME session, ≤2 loops)
+                                      ▼
+                    result delivered to the originating channel (or log)
+```
+
+## What it is / is not
+
+* **Is:** a small Python runner + CLI (`pi-bridge`), a Hermes user plugin
+  (`pi-worker`, 5 tools), durable job state under `~/.local/state/pi-bridge/`,
+  an optional self-waking webhook, and an optional read-only PI WEB observability
+  view.
+* **Is not:** a replacement for either agent. It never touches Hermes core, Pi,
+  pi-open-agents or PI WEB sources; it never installs or updates them; it never
+  picks Pi subagents (the Pi orchestrator does); Pi jobs do not depend on the
+  Hermes gateway being alive (systemd user units + durable state).
+
+## Prerequisites
+
+| Component | Required | Notes |
+|---|---|---|
+| Hermes Agent | yes | user plugin mechanism + `hermes webhook`/gateway for wake; plugin needs no core patches |
+| Pi Coding Agent | yes | CLI print mode with `--print --agent --session-id` (verified with Pi 0.84.x) |
+| pi-open-agents | optional | gives the Pi orchestrator explorer/worker/reviewer; the bridge itself does not require it |
+| PI WEB | optional | read-only observability of delegated sessions; bridge works fully without it |
+| systemd user session | strongly recommended | durable detached jobs; without it the runner falls back to a detached child that does not survive user-session restarts |
+| Python 3.10+ | yes | for the bridge itself |
+
+## Install
+
+```bash
+git clone <this-repo> pi-hermes-bridge
+cd pi-hermes-bridge
+./install.sh
+```
+
+`install.sh` is conservative by design: it checks prerequisites and compatibility
+(Pi binary discovery + `pi --version` + print-mode capability probe, Hermes CLI
+presence, systemd user session), creates a venv, installs the bridge CLI, registers
+the Hermes plugin and offers to enable it. **It never installs/updates Hermes, Pi
+or PI WEB** and never restarts the running gateway without asking. To enable the
+completion wake channel (recommended) follow `docs/WAKE_SETUP.md` — it is a
+documented operator step (HMAC secret + one route in Hermes config).
+
+## Tools exposed to Hermes
+
+| Tool | Purpose |
+|---|---|
+| `pi_delegate` | submit a task (returns immediately with `job_id`, captures delivery origin) |
+| `pi_status` | status + compact final result (never the full transcript) |
+| `pi_feedback` | continue the **same** Pi session with review notes |
+| `pi_cancel` | safely stop a running job (bridge-created jobs only) |
+| `pi_list` | recent jobs (id/status/cwd/task preview) — lost-context recovery |
+
+## Features
+
+* **Durable jobs** — per-job dir under `$PI_BRIDGE_HOME` (default
+  `~/.local/state/pi-bridge`), atomic writes + flock, per-turn systemd units,
+  restart-safe status reconciliation.
+* **Self-waking Hermes** — after every terminal turn the runner POSTs an
+  HMAC-signed webhook to the local Hermes gateway; the woken run does the
+  acceptance check, reports or repairs (`pi_feedback`, ≤2 automatic loops), and
+  delivers into the *originating* channel (per `docs/WAKE_SETUP.md`; no global
+  fallback channel).
+* **Recovery** — after any restart or lost model context, `pi_list` finds jobs;
+  the wake client retries ~45 minutes through gateway restarts.
+* **Pi Web observability (optional, read-only)** — `pi-bridge web-info <job>`
+  and the `pi_web` field report whether the job's Pi session is visible in PI
+  WEB, with a deep link; when PI WEB is down the bridge behaves exactly as
+  before.
+* **Safety** — no `shell=True`, task via stdin, argv only, generated job ids,
+  bounded outputs, structured errors, secrets never stored in job state.
+
+## Pi orchestrator example
+
+The bridge always invokes `pi --agent orchestrator`; configuring what that agent
+is (model, prompt, allowed subagents) is Pi's own job. A minimal pi-open-agents
+setup: `~/.pi/agent/agents/orchestrator.md` declaring
+`allowedAgents: explorer, worker, reviewer` — see `docs/PI_ORCHESTRATOR_EXAMPLE.md`.
+No model is prescribed.
+
+## Routing policy
+
+How Hermes decides *when* to delegate lives in `docs/ROUTING_POLICY.md`:
+delegate substantial code/scripts/Docker/systemd/infra work; keep quick read-only
+checks and non-technical requests local; one logical task = one job; never
+prescribe subagents. Hermes ships this as a short always-loaded snippet plus an
+optional skill — no core patches.
+
+## Compatibility / self-test
+
+```bash
+.venv/bin/pi-bridge install            # discovery + capability check
+python -m pytest tests/ -q             # 71 tests, fake pi / fake PI WEB / fake webhook receiver
+```
+
+## Uninstall / rollback
+
+```bash
+hermes plugins disable pi-worker
+hermes plugins remove pi-worker        # or: rm -rf ~/.hermes/plugins/pi-worker
+./uninstall.sh                         # removes venv + CLI symlink + bridge state (asks first)
+```
+
+Hermes, Pi, pi-open-agents and PI WEB are left untouched.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Key points: webhook is loopback-only + HMAC V2
+with timestamp binding and idempotency; task text never touches a shell; PI WEB
+integration is read-only and optional; job state contains no secrets.
+
+## License
+
+MIT (see [LICENSE](LICENSE)). Third-party components (Hermes, Pi, pi-open-agents,
+PI WEB) remain under their own licenses; this project only integrates them through
+their public plugin/CLI interfaces.
