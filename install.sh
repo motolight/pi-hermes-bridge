@@ -183,7 +183,7 @@ fi
 # ---------------------------------------------------------------------------
 say "3/8 python venv + bridge CLI"
 [ -d .venv ] || "$PYTHON" -m venv .venv
-.venv/bin/pip install -q --upgrade pip >/dev/null
+.venv/bin/pip install -q --upgrade pip >/dev/null 2>&1 || true   # best-effort; a flaky network must not stop the install
 PIP_NET="--timeout 60 --retries 3"
 .venv/bin/pip install -q $PIP_NET -e . || die "pip install -e . failed (network needed for the ruamel.yaml dependency; or pre-populate the pip cache)"
 .venv/bin/pi-bridge --help >/dev/null || die "pi-bridge CLI did not install cleanly"

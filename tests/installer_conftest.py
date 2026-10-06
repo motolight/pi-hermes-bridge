@@ -6,16 +6,39 @@ in tests/fakes/bin.
 """
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 FACKS = REPO / "tests" / "fakes"
+
+
+@functools.lru_cache(maxsize=1)
+def wheelhouse() -> Path:
+    """One-time local wheel cache (project + deps + build deps).
+
+    The installer e2e tests create a real venv per scenario; with a flaky or
+    throttled PyPI, `pip install -e .` fails on build isolation.  With
+    PIP_FIND_LINKS pointed here pip resolves everything locally and only
+    falls back to the index if something is genuinely missing.
+    """
+    wh = Path(tempfile.gettempdir()) / "pibridge-wheelhouse"
+    wh.mkdir(exist_ok=True)
+    marker = wh / ".built-v0.2.0"
+    if not marker.exists():
+        subprocess.run(
+            [sys.executable, "-m", "pip", "wheel", "-q", "-w", str(wh),
+             "--timeout", "120", str(REPO), "ruamel.yaml", "setuptools", "wheel"],
+            check=True, timeout=1200)
+        marker.touch()
+    return wh
 
 EXTRA_ROUTE_YAML = """\
 model: some/model
@@ -71,6 +94,8 @@ class Sandbox:
             "XDG_RUNTIME_DIR": "",          # no systemd user session in sandbox
             "PI_BRIDGE_SKIP_TESTS": "1",
             "PYTHONPATH": "",               # no leakage; editable install handles imports
+            "PIP_FIND_LINKS": str(wheelhouse()),
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         })
         # HARD isolation: PATH contains ONLY the sandbox fakes + coreutils.
         # Never inherit the caller PATH: it contains a real `hermes`/`pi`, and

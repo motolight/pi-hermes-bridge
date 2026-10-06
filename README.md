@@ -176,7 +176,7 @@ always-on managed block in `SOUL.md` plus the portable
 
 ```bash
 .venv/bin/pi-bridge install            # discovery + capability check
-python -m pytest tests/ -q             # 98 tests: fake pi / fake PI WEB / fake webhook receiver / fake hermes + installer e2e
+python -m pytest tests/ -q             # 105 tests: fake pi / fake PI WEB / fake webhook receiver / fake hermes + installer e2e
 ```
 
 ## Uninstall / rollback
