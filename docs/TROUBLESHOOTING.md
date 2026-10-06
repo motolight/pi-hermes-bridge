@@ -27,7 +27,10 @@ recover context without creating a duplicate delegate.
 2. Route exists and webhook platform enabled (`docs/WAKE_SETUP.md`).
 3. Secret matches between `~/.hermes/config.yaml` route and
    `$PI_BRIDGE_HOME/wake.json` (mismatch → gateway logs 401).
-4. Runner wake log: `$PI_BRIDGE_HOME/wake.log`.
+4. Wake delivery log for a job: `$PI_BRIDGE_HOME/jobs/<job_id>/runner.log`
+   (`wake tN:` lines); the current delivery state is in
+   `pi-bridge status <job> --json` under `.wake` (delivered / attempts /
+   last_error).
 5. `wake.json` `enabled: false` disables the channel instantly (no restart).
 
 ## Woken run can't reply into the original WebUI conversation
@@ -39,9 +42,14 @@ next user turn. That is intended behavior, not a lost job.
 
 ## PI WEB doesn't show delegated sessions
 
-Observability is best-effort and read-only. Check `pi-bridge web-info <job>`:
-`reachable: false` → PI WEB down / `PI_BRIDGE_PIWEB_URL` unset (bridge unaffected).
-`project_registered: false` → the job cwd is outside PI WEB `allowedPaths`; add
+Observability is best-effort and read-only. Check `pi-bridge web-info <job>`
+(its base URL comes from `$PI_WEB_URL`, else `$PI_WEB_CONFIG`, else
+`http://127.0.0.1:8504`; set `PI_BRIDGE_NO_PIWEB=1` to switch the view off
+entirely):
+`"available": false` with an `unreachable` reason → PI WEB is down / wrong URL
+(bridge unaffected, the `pi_web` view just degrades).
+`"reason": "project-not-registered"` or `"cwd-outside-allowed-paths"` → the job
+cwd is outside PI WEB's `allowedPaths`; add
 the path to PI WEB's own config (operator action; the bridge never edits it).
 External CLI sessions may need a UI reload in some PI WEB versions — that is a
 PI WEB UI limitation, not a bridge bug.

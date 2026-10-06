@@ -41,8 +41,8 @@ User ──▶ Hermes ──▶ pi_delegate ──▶ bridge runner (systemd, du
 | Component | Required | Notes |
 |---|---|---|
 | Hermes Agent | yes | user plugin mechanism + `hermes webhook`/gateway for wake; plugin needs no core patches |
-| Pi Coding Agent | yes | CLI print mode with `--print --agent --session-id` (verified with Pi 0.84.x) |
-| pi-open-agents | optional | gives the Pi orchestrator explorer/worker/reviewer; the bridge itself does not require it |
+| Pi Coding Agent | yes | CLI print mode with `--print --session-id --session-dir` (verified with Pi 0.84.x) |
+| pi-open-agents (or equivalent) | yes | the bridge always runs `pi --agent orchestrator`, and `--agent` is provided by this extension (not pi core); it also gives the Pi orchestrator explorer/worker/reviewer. Any extension defining `--agent` + an `orchestrator` agent works the same |
 | PI WEB | optional | read-only observability of delegated sessions; bridge works fully without it |
 | systemd user session | strongly recommended | durable detached jobs; without it the runner falls back to a detached child that does not survive user-session restarts |
 | Python 3.10+ | yes | for the bridge itself |
@@ -57,8 +57,9 @@ cd pi-hermes-bridge
 
 `install.sh` is conservative by design: it checks prerequisites and compatibility
 (Pi binary discovery + `pi --version` + print-mode capability probe, Hermes CLI
-presence, systemd user session), creates a venv, installs the bridge CLI, registers
-the Hermes plugin and offers to enable it. **It never installs/updates Hermes, Pi
+presence, systemd user session), creates a venv, installs the bridge CLI and
+links it at `~/.local/bin/pi-bridge` (where the pi-worker plugin looks for it),
+registers the Hermes plugin and offers to enable it. **It never installs/updates Hermes, Pi
 or PI WEB** and never restarts the running gateway without asking. To enable the
 completion wake channel (recommended) follow `docs/WAKE_SETUP.md` — it is a
 documented operator step (HMAC secret + one route in Hermes config).
@@ -94,9 +95,11 @@ documented operator step (HMAC secret + one route in Hermes config).
 
 ## Pi orchestrator example
 
-The bridge always invokes `pi --agent orchestrator`; configuring what that agent
-is (model, prompt, allowed subagents) is Pi's own job. A minimal pi-open-agents
-setup: `~/.pi/agent/agents/orchestrator.md` declaring
+The bridge always invokes `pi --agent orchestrator`; the `--agent` flag and the
+`orchestrator` agent itself come from the pi-open-agents extension (or an
+equivalent you configure) — configuring what that agent is (model, prompt,
+allowed subagents) is Pi's own job. A minimal pi-open-agents setup:
+`~/.pi/agent/agents/orchestrator.md` declaring
 `allowedAgents: explorer, worker, reviewer` — see `docs/PI_ORCHESTRATOR_EXAMPLE.md`.
 No model is prescribed.
 

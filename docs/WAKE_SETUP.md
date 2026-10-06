@@ -43,33 +43,29 @@ idempotency cache (`webhook.py:552-557`) answers
 
 ## 0. Prerequisites
 
-- `pi-bridge` installed (`~/pi-hermes-bridge/.venv/bin/pi-bridge`) and the
-  `pi-worker` plugin installed + enabled **for the gateway profile** (the woken
-  run is a gateway run, so the plugin must be visible to the gateway).
-  Check: `hermes plugins list`, `hermes plugins show pi-worker`.
-- **Refresh the installed plugin copy.** On this machine
-  `~/.hermes/plugins/pi-worker` is a *copy* (not a symlink) of the plugin from
-  the V1 era — `version: 0.1.0`, 4 tools, no `pi_list`, no wake-aware
-  descriptions. The wake run needs `pi_status`/`pi_feedback`/`pi_list`, so
-  re-install/update it from `~/pi-hermes-bridge/plugin/` (and
-  restart the gateway so the tool registry is rebuilt) before trusting the
-  channel. As of V1.3 the plugin is `version: 0.3.0` — the installed copy
-  must be at least this version for the delivery **origin** to be captured
-  at all (older copies submit without the `--origin-*` flags, so every job
-  becomes log-only). `hermes plugins validate
-  ~/pi-hermes-bridge/plugin/` is the read-only gate.
+- `pi-bridge` installed (by default `install.sh` links it at
+  `~/.local/bin/pi-bridge`; the venv copy is `./pi-hermes-bridge/.venv/bin/pi-bridge`)
+  and the `pi-worker` plugin installed + enabled **for the gateway profile**
+  (the woken run is a gateway run, so the plugin must be visible to the
+  gateway). Check: `hermes plugins list`, `hermes plugins show pi-worker`.
+- **Plugin version >= 0.3.0.** A `pi-worker` copy installed before V1.3 (for
+  example one still reporting `version: 0.1.0`, 4 tools, no `pi_list`) must be
+  refreshed: re-copy `./plugin/` over `~/.hermes/plugins/pi-worker` and
+  restart the gateway so the tool registry is rebuilt. Older copies lack
+  `pi_list` and submit without the `--origin-*` flags, so every job becomes
+  log-only. `hermes plugins validate ./plugin/` is the read-only gate.
 - Port 8644 free: `ss -ltn '( sport = :8644 )'` → no output.
-- Nothing is enabled yet on this machine (re-verified 2026-10-06): `config.yaml`
-  has no `platforms:` block, `~/.hermes/webhook_subscriptions.json` does not
-  exist, nothing listens on 8644.
+- Nothing to pre-enable: the wake channel stays off until step 2 (route) and
+  step 4 (`wake.json`) are both done.
 
 ## 1. Generate one shared secret
 
 ```bash
 umask 077
 WAKE_SECRET="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
-printf '%s' "$WAKE_SECRET" > /root/pi-bridge-wake-secret   # or your secret store
-chmod 600 /root/pi-bridge-wake-secret
+mkdir -p ~/.config
+printf '%s' "$WAKE_SECRET" > ~/.config/pi-bridge-wake-secret   # or your secret store
+chmod 600 ~/.config/pi-bridge-wake-secret
 ```
 
 The same secret goes into the route config (step 2) and into `wake.json`

@@ -126,7 +126,7 @@ def discover_pi_bin() -> str:
 
 def check_pi_capability(pi_path: str) -> str:
     """Verify the binary answers `pi --version` and supports the print-mode flags the
-    bridge needs (--print, --agent, --session-id, --session-dir, --no-session).
+    bridge needs (--print, --agent, --session-id, --session-dir).
     Returns version string; raises BridgeError with a clear message otherwise."""
     import subprocess
     try:
@@ -142,8 +142,12 @@ def check_pi_capability(pi_path: str) -> str:
         help_text = ""
     missing = [f for f in ("--print", "--agent", "--session-id", "--session-dir") if f not in help_text]
     if missing:
+        hint = (" NOTE: --agent is provided by the pi-open-agents extension (or an "
+                "equivalent), not by pi core; configure it in the pi agent home "
+                "first (docs/PI_ORCHESTRATOR_EXAMPLE.md)."
+                if "--agent" in missing else "")
         raise BridgeError(f"pi at {pi_path} lacks required flags: {', '.join(missing)} "
-                          "(bridge needs pi print-mode with --agent/--session-id)")
+                          "(bridge needs pi print-mode with --agent/--session-id)." + hint)
     return (v.stdout or "").strip().splitlines()[0] if (v.stdout or v.stderr).strip() else "unknown"
 
 

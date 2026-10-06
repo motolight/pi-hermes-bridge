@@ -1,10 +1,11 @@
 # Example Pi orchestrator + subagents configuration
 
-The bridge always runs `pi --print --agent orchestrator`. What that agent *is*
-belongs to Pi's own configuration — nothing here is required by the bridge, and
-no model is prescribed. This example assumes the `pi-open-agents` extension
-(explorer/worker/reviewer roles); any other subagent scheme works the same,
-because the bridge never inspects or steers subagents.
+The bridge always runs `pi --print --agent orchestrator`. The `--agent` flag and
+the `orchestrator` agent are not pi-core built-ins — they come from your pi
+configuration, in practice from the `pi-open-agents` extension
+(explorer/worker/reviewer roles), which is the setup this example assumes. Any
+other extension that provides `--agent` and an `orchestrator` agent works the
+same, because the bridge never inspects or steers subagents.
 
 ```
 ~/.pi/agent/
@@ -46,8 +47,8 @@ pipeline:
 Key properties that matter for the bridge contract:
 
 * The **orchestrator's turn end** is the job's wake trigger — the bridge fires
-  after every terminal turn, so a long job may wake Hermes several times
-  (queued→running→completed transitions and intermediate turns).
+  when a turn ends `completed` or `failed`. One `pi_delegate` wakes Hermes
+  once; every `pi_feedback` turn that then completes wakes Hermes again.
 * **Session continuity** (`--session-id` print mode) is what makes `pi_feedback`
   continue the same orchestrator conversation — including whatever subagents it
   had already used.

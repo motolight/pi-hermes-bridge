@@ -40,8 +40,10 @@
 - Read-only: `GET /api/...` and a single `POST /api/projects` registration of an
   existing working directory. It never edits PI WEB configuration, sessions or
   trust settings, and it degrades to "unavailable" on any error.
-- Disable it (default) by leaving `PI_BRIDGE_PIWEB_URL` unset/unreachable — no
-  behavior change.
+- Best-effort by default: when PI WEB is unreachable the view degrades to
+  `{"available": false}` and job behavior is unchanged. Disable it entirely
+  with `PI_BRIDGE_NO_PIWEB=1`; point it elsewhere with `PI_WEB_URL` /
+  `PI_WEB_CONFIG` (default `http://127.0.0.1:8504`).
 
 ## What the woken run can do
 
