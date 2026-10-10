@@ -146,7 +146,7 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   restart-safe status reconciliation.
 * **Outcome delivery by origin (V1.4)** — after every terminal turn the runner
   itself hands the result back along the job's recorded origin: `hermes send -t
-  <platform>:<chat_id>[:<thread>]` for messaging platforms, `hermes --resume
+  <platform>:<chat_id>[:<thread_id>]` for messaging platforms, `hermes --resume
   <ui_session_id> chat -q … -Q --source tool` for `webui`, and *nothing* for an
   empty/unknown origin (no default channel, no Telegram fallback). argv only,
   never a shell, hard timeout, no retries — so a result that merely looks like
@@ -189,7 +189,7 @@ always-on managed block in `SOUL.md` plus the portable
 
 ```bash
 .venv/bin/pi-bridge install            # discovery + capability check
-python -m pytest tests/ -q             # 105 tests: fake pi / fake PI WEB / fake webhook receiver / fake hermes + installer e2e
+python -m pytest tests/ -q             # 134 tests: fake pi / fake PI WEB / fake webhook receiver / fake hermes + installer e2e
 ```
 
 ## Uninstall / rollback

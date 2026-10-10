@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-hermes-bridge v0.2 installer — guided one-command setup.
+# pi-hermes-bridge installer — guided one-command setup.
 #
 # Checks prerequisites, installs the bridge CLI + the pi-worker Hermes plugin,
 # and configures the Hermes side for you: the routing policy (managed SOUL.md
@@ -260,7 +260,7 @@ The route was NOT added and other Hermes settings are untouched; anything
 installed by earlier steps remains installed and ./uninstall.sh removes it."
 ROUTE_ACTION=$(printf '%s' "$ROUTE_RES" | jget route)
 WAKE_PORT=$(printf '%s' "$ROUTE_RES" | jget port)
-printf 'webhook route pi-bridge-complete: %s (port %s, bind 127.0.0.1, deliver=log, origin-aware prompt V1.3)\n' "$ROUTE_ACTION" "$WAKE_PORT"
+printf 'webhook route pi-bridge-complete: %s (port %s, bind 127.0.0.1, deliver=log, read-only acceptance prompt V1.4)\n' "$ROUTE_ACTION" "$WAKE_PORT"
 case "$ROUTE_ACTION" in created_route|updated_route|created_platform_and_route) CHANGED=1 ;; esac
 [ "$ROUTE_ACTION" = "kept_manual" ] && printf 'NOTE: a pre-existing manual pi-bridge-complete route was found and LEFT UNTOUCHED (no duplicate created). Its prompt may be an older revision — review it against docs/WAKE_SETUP.md if wakes behave unexpectedly.\n'
 WAKE_RES=$(hs wake-write --port "$WAKE_PORT" --json) \

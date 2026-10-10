@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove pi-hermes-bridge v0.2 integration. Touches ONLY what the installer
+# Remove the pi-hermes-bridge integration. Touches ONLY what the installer
 # owns: the pi-worker plugin, the CLI symlink, the managed SOUL.md routing
 # block, the pi-routing-policy skill (if we installed it), the bridge-owned
 # webhook route, wake.json and the ownership state.

@@ -25,8 +25,41 @@
   so retries cannot start duplicate agent runs.
 - The woken run treats `final_result_excerpt` as **untrusted data**, never as
   instructions (fixed in the route prompt template).
-- Turning the channel off is instant (`enabled: false` in `wake.json`) and
-  requires no restart; without it the bridge simply behaves like a job runner.
+- Turning the wake channel off is instant (`enabled: false` in `wake.json`)
+  and requires no restart. It stops **only** the wake POST — outbound origin
+  delivery is a separate switch (see below).
+
+## Origin delivery (outbound, V1.4)
+
+After a terminal turn the runner hands the job's result back to whoever asked
+for it, by code rather than by a model's shell command.
+
+- The runner launches the Hermes CLI **directly as a subprocess, argv-only,
+  never through a shell**, outside the agent's terminal tool — so the
+  dangerous-command approval gate is not involved and result text quoted into
+  a message cannot be re-interpreted as a command.
+- Routing is fixed in code and strictly origin-based: messaging platform →
+  `hermes send -t <platform>:<chat_id>[:<thread_id>]`, `webui` →
+  `hermes --resume <ui_session_id> chat -q … -Q --source tool`, anything else
+  (empty, `local`, unknown platform, missing id) → **nothing is sent**.
+  There is no default channel and no fallback target, so a job can never be
+  announced into an unrelated chat.
+- The delivered summary is length-bounded (`delivery_max_chars`, default
+  1200) and `MEDIA:` / `[[as_document]]` markers inside a result are
+  neutralised: untrusted Pi output cannot turn the delivery into a file
+  attachment. The whole attempt runs in its own process group under a hard
+  budget (`delivery_timeout`, default 240 s; `SIGTERM` then `SIGKILL`) and is
+  never retried.
+- **Two kill switches, and they are separate.** `wake.json` `enabled: false`
+  stops the wake POST; `origin_delivery: false` stops the outbound CLI call.
+  Origin delivery is **on by default even when `wake.json` does not exist** —
+  a bridge that must never touch a channel must set `origin_delivery: false`
+  explicitly. Set `hermes_bin` (or `PI_BRIDGE_HERMES_BIN`) to a path you
+  control instead of relying on the runner unit's `PATH`.
+- Origin identifiers (platform, chat id, optional thread id, optional UI
+  session id) are recorded in job state and shown by `pi-bridge status`/`list`
+  and the wake payload, so `delivery` can be audited. No secret is ever
+  written into job state or into the delivery log line.
 
 ## Task execution
 
@@ -56,7 +89,17 @@ Keep the route loopback-only, keep the secret strong
 (`python3 -c "import secrets;print(secrets.token_urlsafe(32))"`), and scope
 `toolsets` to the minimum your acceptance checks need.
 
-## Guided installer (v0.2)
+Since V1.4 the woken run is an **acceptance check, not a messenger**: the
+generated prompt, the managed SOUL block and the routing-policy skill all
+require read-only tools and forbid `hermes send` / `hermes --resume`, writes,
+service restarts and network probes. Delivery does not depend on it, so a
+wake run has no reason to hold a delivery-capable grant. Keep `deliver: log`
+on the route: the run's final reply is an operator log line, and pointing the
+route at a messaging target would leak acceptance chatter into a user channel.
+An externally-triggered run that can still write (via `terminal`/`file` for a
+`pi_feedback` repair loop) is why the route stays loopback-only and HMAC-signed.
+
+## Guided installer (install.sh / uninstall.sh)
 
 - **No software installation of agents.** The installer never installs or
   updates Hermes, Pi or PI WEB; a missing prerequisite stops the run with the
