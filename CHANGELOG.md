@@ -2,8 +2,18 @@
 
 All notable changes to pi-hermes-bridge are documented here. Versions follow
 the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
-the `V1.x` labels in the prose and in `docs/` refer to the bridge protocol
-revision, which is one notch ahead of the package version.
+the `V1.x` labels in the prose and in `docs/` name the bridge protocol
+revision, which is tracked independently of the package version.
+
+## Unreleased
+
+* docs: the manual static-route prompt in `docs/WAKE_SETUP.md` section 2 was a
+  shortened V1.4 variant — it lacked the approval-gate circuit breaker ("do
+  NOT retry or rephrase a gated call, end the turn"), `never sudo`, and
+  `pi_status`/`pi_list` in the read-only allow-list, so a hand-installed route
+  got a weaker prompt than `install.sh` writes. Now rule-for-rule the same as
+  `hermes_setup.WAKE_PROMPT`, with a cross-reference to keep them in step.
+  Docs only; no code or behaviour change.
 
 ## 0.3.0 — 2026-10-08 (protocol V1.4)
 
@@ -18,11 +28,12 @@ code instead of by a prompt instruction.
   --resume <ui_session_id> chat -q … -Q --source tool` for `webui`, and
   *nothing* for an empty/`local`/unknown origin. No default channel, no
   Telegram fallback, no retries.
-  The woken Hermes run is now a read-only acceptance check: its generated
-  prompt (`hermes_setup.WAKE_PROMPT`, the SOUL block, `pi-routing-policy`, the
-  `pi-worker` tool descriptions and `docs/WAKE_SETUP.md`) forbids `hermes
-  send` / `hermes --resume`, writes, service restarts and network probes, and
-  states that delivery does not depend on it.
+  The woken Hermes run is now a read-only acceptance check. The generated
+  wake prompt (`hermes_setup.WAKE_PROMPT`), the managed SOUL block and the
+  `pi-routing-policy` skill forbid `hermes send` / `hermes --resume`, writes,
+  service restarts and network probes and say delivery does not depend on the
+  run; the `pi-worker` tool descriptions and `docs/WAKE_SETUP.md` state that
+  the bridge delivers, so the woken run must not send anything itself.
 * **Delivery status is reported apart from the wake notification.** Jobs now
   carry `delivery: {attempted, ok, kind, channel, reason, error, turn, at}`,
   surfaced by `pi-bridge status`/`list` --json and in the wake payload, so
