@@ -421,8 +421,10 @@ def test_wake_permanent_error_gives_up_early(env, workdir):
 # pi_list
 # --------------------------------------------------------------------------
 
+# V1.4 adds the origin-delivery summary to the compact row as well.
 LIST_KEYS = {"job_id", "status", "cwd", "created_at", "updated_at",
-             "task_preview", "feedback_turns", "turns", "wake", "origin"}
+             "task_preview", "feedback_turns", "turns", "wake", "delivery",
+             "origin"}
 
 
 def test_pi_list_rows_limit_and_no_transcript(env, workdir):

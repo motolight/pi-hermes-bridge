@@ -19,8 +19,10 @@ session** if something still needs fixing.
 - **Keep Hermes as the manager.** Hermes owns the user conversation, context,
   constraints and acceptance criteria; Pi owns implementation details.
 - **Keep an independent acceptance loop.** When Pi finishes, Hermes wakes up,
-  checks the actual result, and can send concrete feedback back into the same Pi
-  session for another repair turn.
+  checks the actual result with read-only tools, and can send concrete feedback
+  back into the same Pi session for another repair turn. The *user-visible*
+  delivery is not part of that loop: the runner delivers the outcome along the
+  job's origin channel itself before waking anyone.
 - **Stop babysitting long jobs.** Jobs are durable, survive gateway interruptions,
   can be recovered with `pi_list`, and do not require the user to keep asking
   "is it done yet?"
@@ -48,11 +50,12 @@ User ──▶ Hermes ──▶ pi_delegate ──▶ bridge runner (systemd, du
                               Pi orchestrator ──▶ its own subagents
                                       │  (session store JSONL, append-only)
                                       ▼
-            turn terminal ──▶ wake event (HMAC webhook) ──▶ Hermes wake run
-                                      │
-                     acceptance check │ fail → pi_feedback (SAME session, ≤2 loops)
-                                      ▼
-                    result delivered to the originating channel (or log)
+            turn terminal ──▶ origin delivery (hermes send / --resume, argv)
+                              │  then wake event (HMAC webhook) ──▶ Hermes wake run
+                              │            acceptance check │ fail → pi_feedback
+                              ▼                             ▼        (SAME session, ≤2 loops)
+        outcome reaches the originating channel     log only; the wake run
+        (or nowhere, if the origin is unknown)      never sends messages
 ```
 
 ## What it is / is not
@@ -113,8 +116,8 @@ normal path.** Concretely, `install.sh`:
    re-running updates the block instead of duplicating it.
 5. **Configures the completion wake** — a fresh random HMAC secret (wake.json
    mode 0600), the `pi-bridge-complete` static route in
-   `~/.hermes/config.yaml` (loopback bind, `deliver: log`, origin-aware
-   V1.3 prompt), and `$PI_BRIDGE_HOME/wake.json`. Foreign webhook routes,
+   `~/.hermes/config.yaml` (loopback bind, `deliver: log`, read-only V1.4
+   acceptance prompt), and `$PI_BRIDGE_HOME/wake.json`. Foreign webhook routes,
    settings and a pre-existing manual route are detected and left untouched
    — no duplicates on upgrade from v0.1/manual setup.
 
@@ -141,11 +144,19 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
 * **Durable jobs** — per-job dir under `$PI_BRIDGE_HOME` (default
   `~/.local/state/pi-bridge`), atomic writes + flock, per-turn systemd units,
   restart-safe status reconciliation.
-* **Self-waking Hermes** — after every terminal turn the runner POSTs an
-  HMAC-signed webhook to the local Hermes gateway; the woken run does the
-  acceptance check, reports or repairs (`pi_feedback`, ≤2 automatic loops), and
-  delivers into the *originating* channel (per `docs/WAKE_SETUP.md`; no global
-  fallback channel). `install.sh` configures this channel for you.
+* **Outcome delivery by origin (V1.4)** — after every terminal turn the runner
+  itself hands the result back along the job's recorded origin: `hermes send -t
+  <platform>:<chat_id>[:<thread>]` for messaging platforms, `hermes --resume
+  <ui_session_id> chat -q … -Q --source tool` for `webui`, and *nothing* for an
+  empty/unknown origin (no default channel, no Telegram fallback). argv only,
+  never a shell, hard timeout, no retries — so a result that merely looks like
+  a dangerous command cannot be stuck behind an approval gate nobody can answer
+  in a webhook session.
+* **Self-waking Hermes** — then the runner POSTs an HMAC-signed webhook to the
+  local Hermes gateway; the woken run does a **read-only** acceptance check and
+  either repairs (`pi_feedback`, ≤2 automatic loops) or ends. It never delivers
+  anything itself. `install.sh` configures this channel for you (log-only
+  route).
 * **Recovery** — after any restart or lost model context, `pi_list` finds jobs;
   the wake client retries ~45 minutes through gateway restarts.
 * **Pi Web observability (optional, read-only)** — `pi-bridge web-info <job>`

@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import piweb, state, wake
+from . import deliver, piweb, state, wake
 from .state import BridgeError
 
 # Max chars of the final result kept inside job.json / returned by status.
@@ -33,10 +33,10 @@ MAX_TASK_CHARS = 200_000
 ENV_SNAPSHOT_KEYS = ("PATH", "HOME", "LANG", "LC_ALL")
 
 # --------------------------------------------------------------------------
-# Origin capture (V1.3): where the delegation request came from, so a woken
-# Hermes run can deliver the result back to the *right* channel.  The bridge
-# stores this and echoes it in status/list; it NEVER interprets it, routes on
-# it or delivers anything itself.  Validation drops malformed values silently
+# Origin capture (V1.3): where the delegation request came from.  Since V1.4
+# the bridge ALSO delivers the finished result back along it (see
+# pi_bridge/deliver.py): the woken Hermes run is a read-only quality check,
+# never the delivery channel.  Validation drops malformed values silently
 # (origin is best-effort metadata, never a hard input error).
 # --------------------------------------------------------------------------
 ORIGIN_PLATFORM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -212,6 +212,8 @@ FORWARD_ENV_KEYS = (
     "PI_BRIDGE_WAKE_PERMANENT_AFTER", "PI_BRIDGE_WAKE_HTTP_TIMEOUT",
     "PI_BRIDGE_WAKE_PIWEB_BUDGET", "PI_BRIDGE_NO_PIWEB",
     "PI_BRIDGE_PIWEB_BUDGET", "PI_BRIDGE_RESULT_LIMIT",
+    "PI_BRIDGE_DELIVERY_TIMEOUT", "PI_BRIDGE_DELIVERY_MAX_CHARS",
+    "PI_BRIDGE_HERMES_BIN",
     "PI_WEB_URL", "PI_WEB_CONFIG",
 )
 
@@ -541,10 +543,15 @@ def status_view(job: dict, full: bool = False) -> dict:
         "unit": lr.get("unit"),
         "runner_pid": lr.get("pid"),
         "error": (job.get("error") or "")[:ERROR_KEEP] or None,
-        # Wake-notifier delivery bookkeeping for the current turn (no secret).
+        # Wake-notifier bookkeeping for the current turn (no secret).  NOTE:
+        # wake.delivered only means the wake POST was accepted by the gateway
+        # (an agent run was started) -- it never meant "the user saw it".
+        # The user-visible outcome is `delivery` below.
         "wake": wake.normalize_state(job, enabled=wake.is_enabled()),
-        # Delivery origin as recorded at submit time (dict or null). Metadata
-        # for the woken run to route its reply; the bridge ignores it.
+        # Origin delivery of the outcome (V1.4): attempted / ok / channel /
+        # reason.  Absent-but-null for jobs that never ran a terminal turn.
+        "delivery": deliver.normalize_state(job),
+        # Delivery origin as recorded at submit time (dict or null).
         "origin": job.get("origin") or None,
         "log_dir": str(state.job_dir(job["job_id"])),
         "final_result_chars": job.get("final_result_chars") or 0,
@@ -587,6 +594,11 @@ def list_rows(jobs: list[dict], limit: int = LIST_LIMIT_DEFAULT) -> list[dict]:
             "feedback_turns": len(job.get("feedbacks") or []),
             "turns": len(job.get("turns") or []),
             "wake": {"delivered": w["delivered"], "enabled": w["enabled"]},
+            # Did the outcome actually reach a human channel? (V1.4) Lets a
+            # woken run see that delivery already happened instead of trying
+            # to redo it with its own tools.
+            "delivery": {k: v for k, v in deliver.normalize_state(job).items()
+                         if k in ("attempted", "ok", "channel", "reason")},
             "origin": job.get("origin") or None,
         })
     rows.sort(key=lambda r: (r.get("updated_at") or "", r.get("job_id") or ""),

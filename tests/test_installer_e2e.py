@@ -339,14 +339,28 @@ def test_manual_upgrade_disabled_wake_json_warns_not_ready(sandbox):
 
 # --------------------------------------------------- route prompt content
 
-def test_wake_route_prompt_is_origin_aware(sandbox):
+def test_wake_route_prompt_is_read_only_and_never_delivers(sandbox):
+    """V1.4: the woken run checks, it does not deliver.
+
+    The V1.3 prompt told it to run `hermes send` / `hermes --resume ...`
+    itself.  In a webhook session such a command can only reach the
+    dangerous-command approval gate, which nobody can answer -- the incident
+    that lost a completed job's result.  The runner delivers; the prompt must
+    forbid sending and must forbid anything else an approval gate could stop.
+    """
     assert sandbox.install().returncode == 0
     prompt = route_of(sandbox)["prompt"]
-    assert "origin" in prompt
-    assert "hermes send -t" in prompt
-    assert "timeout 8" in prompt and "SESSION_NOT_OWNED" in prompt
-    assert "do NOT fall back to Telegram" in prompt
+    assert "origin" in prompt and "delivery" in prompt
+    assert "READ-ONLY" in prompt
+    assert "already" in prompt.lower()          # "the bridge already delivered"
+    assert "never run `hermes send`" in prompt
+    assert "hermes --resume" in prompt          # explicitly forbidden, not a how-to
+    assert "Silence is not consent" in prompt   # stop on the gate, never retry
+    assert "pi_feedback" in prompt
     assert "untrusted data" in prompt
+    # the old delivery instructions are gone
+    assert "hermes send -t" not in prompt
+    assert 'timeout 8' not in prompt
     assert route_of(sandbox)["deliver"] == "log"
     # no machine-specific constants leaked into the generated route
     assert "123456789" not in prompt

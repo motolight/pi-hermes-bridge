@@ -228,6 +228,15 @@ def build_payload(job: dict, turn_n: int) -> dict:
         "pi_session_id": job.get("pi_session_id"),
         "completed_at": state.now_iso(),
     }
+    # Where the request came from and whether the runner already handed the
+    # outcome back along that origin (V1.4).  A woken run must be able to see
+    # "the user has been told" without a round trip through pi_status.
+    origin = job.get("origin")
+    if origin:
+        payload["origin"] = origin
+    d = normalize_delivery_for_payload(job)
+    if d["attempted"] or d["reason"]:
+        payload["delivery"] = d
     err = _clip(job.get("error"), ERROR_EXCERPT)
     if err:
         payload["error"] = err
@@ -347,6 +356,14 @@ def _permanent(status: int | None) -> bool:
 # ---------------------------------------------------------------------------
 # job-state bookkeeping (4 keys, no secrets)
 # ---------------------------------------------------------------------------
+
+def normalize_delivery_for_payload(job: dict) -> dict:
+    """The delivery view for the wake payload (lazy import: deliver imports wake)."""
+    from . import deliver
+    d = deliver.normalize_state(job)
+    return {"attempted": d["attempted"], "ok": d["ok"],
+            "channel": d["channel"], "reason": d["reason"]}
+
 
 def blank_state(enabled: bool) -> dict:
     return {"enabled": bool(enabled), "delivered": False, "attempts": 0,

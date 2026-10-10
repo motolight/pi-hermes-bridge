@@ -13,8 +13,9 @@ via pi_delegate (never inline with terminal/file tools). Trivial read-only check
 requests stay with Hermes. Before delegating when unsure a job already exists —
 pi_list. After pi_delegate: tell the user it was handed to Pi, always include the
 job_id, end the turn. On Pi completion wake: pi_status → independent acceptance
-check → on failure pi_feedback in the same session (max 2 repair loops) → then
-report result or honest blocker.
+check (read-only tools only) → on failure pi_feedback in the same session (max
+2 repair loops) → otherwise just end the turn; the bridge delivers the outcome
+to the job's origin channel itself, so a wake run never sends or resumes.
 ```
 
 ## Rationale / expanded rules
@@ -36,9 +37,13 @@ report result or honest blocker.
    enforce them.
 8. After `pi_delegate`: briefly tell the user it was handed to Pi **with the
    job_id**, then end the turn — don't stall the foreground conversation.
-9. On completion wake: (1) get the result, (2) independent acceptance check,
+9. On completion wake: (1) `pi_status` (status, error, result, origin,
+   `delivery`), (2) independent acceptance check with **read-only** tools,
    (3) fail → `pi_feedback` into the same session, (4) max 2 automatic repair
-   loops, (5) then deliver success or an honest blocker.
+   loops, (5) otherwise end the turn with a one-line outcome. **Never deliver
+   from a wake run** — the runner hands the outcome to the job's origin
+   channel itself before waking (V1.4), and an approval-gated send from a
+   webhook session has nobody to approve it.
 10. Before a *repeat* delegate when job existence is uncertain → `pi_list` first
     (duplicate prevention).
 11. PI WEB stays optional observability; it never influences routing/execution.

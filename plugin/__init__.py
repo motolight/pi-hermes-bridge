@@ -193,11 +193,11 @@ _SCHEMAS = {
             "immediately with a job_id; the task runs durably in the "
             "background. The Pi orchestrator manages its own subagents. "
             "Poll with pi_status; refine with pi_feedback. When a turn of "
-            "the job ends, the bridge wakes a Hermes webhook run by itself "
-            "(pi_bridge_turn_complete) -- you do not have to poll for it. "
-            "The current session's delivery origin (platform/chat id) is "
-            "recorded with the job so the woken run can reply to the right "
-            "place; the bridge itself never delivers. "
+            "the job ends, the bridge delivers the outcome back along the "
+            "current session's recorded origin (platform/chat id/"
+            "ui_session_id) itself and wakes a Hermes acceptance run by "
+            "itself (pi_bridge_turn_complete) -- you do not have to poll, "
+            "and you must NOT send the result yourself. "
             "If you don't have a job_id or are unsure a previous delegate "
             "succeeded, call pi_list FIRST and match by task/cwd -- do NOT "
             "blindly re-delegate the same work."
@@ -217,8 +217,9 @@ _SCHEMAS = {
         "name": "pi_list",
         "description": (
             "List recent pi-bridge jobs, newest first: job_id, status, cwd, "
-            "created_at/updated_at, task_preview, turn counts and whether the "
-            "completion wake was delivered. No transcripts. Use this to "
+            "created_at/updated_at, task_preview, turn counts, whether the "
+            "completion wake was delivered and whether the outcome was "
+            "delivered to its origin channel. No transcripts. Use this to "
             "recover job ids after a restart or a context loss, and BEFORE "
             "delegating when you are unsure an earlier pi_delegate succeeded "
             "-- match by task/cwd instead of re-delegating the same work."
@@ -237,10 +238,10 @@ _SCHEMAS = {
         "description": (
             "Get status of a delegated Pi job: queued/running/completed/"
             "failed/cancelled/interrupted, plus a compact final result when "
-            "completed, the wake-notifier delivery state, and the recorded "
-            "delivery origin {platform, chat_id, thread_id, ui_session_id} "
-            "of the requesting session (or null) -- routing metadata for "
-            "the woken run; the bridge does not interpret it. Does not "
+            "completed, the wake-notifier state, the origin-delivery result "
+            "(did the outcome actually reach the requesting channel) and "
+            "the recorded delivery origin {platform, chat_id, thread_id, "
+            "ui_session_id} of the requesting session (or null). Does not "
             "include Pi's internal transcript."
         ),
         "parameters": {

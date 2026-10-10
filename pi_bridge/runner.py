@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import state, wake
+from . import deliver, state, wake
 from .state import BridgeError
 
 RESULT_KEEP = 8000            # chars of final result kept in job.json
@@ -251,6 +251,18 @@ def run_turn(job_id: str, turn_n: int) -> int:
 
         state.save_job(job)
     _log(jd, f"turn {turn_n} done status={job['status']}")
+
+    # Hand the outcome back to whoever asked for it (completed/failed only).
+    # Runs BEFORE the wake notifier on purpose: the user-visible result must
+    # not wait on the webhook (which may be down and retrying for up to 45
+    # minutes), and the wake run is a quality check, not a delivery channel.
+    # Never changes the job status and never raises.
+    if job["status"] in wake.WAKE_STATUSES:
+        try:
+            delivered = deliver.deliver_result(job_id, turn_n)
+        except Exception as e:  # deliver_result guarantees this; belt and braces
+            delivered = {"ok": False, "reason": f"internal:{type(e).__name__}"}
+        _log(jd, f"turn {turn_n} origin delivery: {delivered}")
 
     # Wake Hermes (completed/failed only; a cancelled turn was cancelled by
     # a human).  Blocks until the webhook accepted the delivery or the retry
