@@ -44,7 +44,7 @@ Configuration (same file as the wake notifier; `~/.local/state/pi-bridge/wake.js
     {"enabled": true, "url": "...", "secret": "...",
      "origin_delivery": true,          # false -> this module is a no-op
      "hermes_bin": "",                 # optional absolute path
-     "delivery_timeout": 90,           # seconds, hard SIGKILL
+     "delivery_timeout": 240,          # seconds, SIGTERM then SIGKILL
      "delivery_max_chars": 1200}       # size of the delivered summary
 
 `origin_delivery` defaults to **true** (a wake-enabled bridge delivers by
@@ -79,9 +79,16 @@ MESSAGING_PLATFORMS = frozenset({
 })
 WEBUI_PLATFORM = "webui"
 
-DEFAULT_TIMEOUT = 90.0
+# A webui delivery is a real agent turn in the user's session: startup plus
+# one (often slow, often large-history) model call.  90 s was measured too
+# tight on a 46k-token session behind a local model -- the message landed but
+# the resumed answer was cut off -- so the default is generous and the runner
+# unit (TimeoutStartSec=infinity) is expected to stay alive that long.
+DEFAULT_TIMEOUT = 240.0
 DEFAULT_MAX_CHARS = 1200
-MAX_TIMEOUT = 600.0
+MAX_TIMEOUT = 900.0
+# SIGTERM grace before SIGKILL, so the CLI can close its session cleanly.
+TERM_GRACE = 10.0
 MIN_TIMEOUT = 1.0
 OUTPUT_KEEP = 300
 ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -289,6 +296,32 @@ def _log(jd, msg: str) -> None:
         pass
 
 
+class _DeliveryTimeout(Exception):
+    """The delivery CLI outran its hard budget (already terminated)."""
+
+
+def _run_bounded(argv: list, timeout: float) -> tuple:
+    """Run argv to completion, or terminate it at the deadline.
+
+    Never a shell, never a queue: argv only, output captured, and a SIGTERM
+    before SIGKILL so the CLI can release its session lease and flush.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            stdin=subprocess.DEVNULL)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=TERM_GRACE)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        raise _DeliveryTimeout()
+
+
 def _classify_returncode(stderr: str) -> str:
     """Map the CLI's typed refusal line to a reason code (no retry either way)."""
     m = re.search(r"hermes-refusal-reason:\s*([A-Z_]+)", stderr or "")
@@ -354,10 +387,8 @@ def _deliver(job_id: str, turn_n: int) -> dict:
     _log(jd, f"turn {turn_n} delivery -> {p['channel']} ({p['kind']}, "
              f"{len(text)} chars)")
     try:
-        r = subprocess.run(p["argv"], capture_output=True, text=True,
-                           timeout=cfg["timeout"], stdin=subprocess.DEVNULL)
-        rc, out, err = r.returncode, r.stdout or "", r.stderr or ""
-    except subprocess.TimeoutExpired:
+        rc, out, err = _run_bounded(p["argv"], cfg["timeout"])
+    except _DeliveryTimeout:
         dur = time.monotonic() - started
         _update(job_id, attempted=True, ok=False, channel=p["channel"],
                 kind=p["kind"], reason="timeout",

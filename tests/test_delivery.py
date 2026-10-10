@@ -293,6 +293,23 @@ def test_delivery_hard_timeout_does_not_hang_the_runner(env, workdir, tmp_path):
     assert len(read_calls(log)) == 1
 
 
+def test_timeout_terminates_before_killing(env, workdir, tmp_path):
+    """The hard budget sends SIGTERM first: the CLI may release its session."""
+    mark = tmp_path / "term.mark"
+    e, log = hermes_env(tmp_path, mode="sleep",
+                        extra={"FAKE_HERMES_SLEEP": "30",
+                               "PI_BRIDGE_DELIVERY_TIMEOUT": "1",
+                               "FAKE_HERMES_TERM_MARK": str(mark)})
+    jid = submit(env, workdir, WEBUI_ORIGIN, extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e, timeout=20)
+    assert st["delivery"]["reason"] == "timeout"
+    deadline = time.time() + 5
+    while time.time() < deadline and not mark.exists():
+        time.sleep(0.2)
+    assert mark.exists(), "the CLI was killed without SIGTERM first"
+    assert len(read_calls(log)) == 1
+
+
 def test_failed_turn_delivers_the_error(env, workdir, tmp_path):
     e, log = hermes_env(tmp_path)
     jid = submit(env, workdir, WEBUI_ORIGIN, extra_env=e,

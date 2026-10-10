@@ -211,7 +211,7 @@ read-only acceptance check.
 {"enabled": true, "url": "...", "secret": "...",
  "origin_delivery": true,             // false -> never call the CLI (V1.3 log-only)
  "hermes_bin": "/ABS/PATH/TO/hermes", // optional; systemd units get a clean PATH
- "delivery_timeout": 90,              // seconds, hard kill, never retried
+ "delivery_timeout": 240,             // seconds, SIGTERM then kill; never retried
  "delivery_max_chars": 1200}          // size of the delivered summary
 ```
 
@@ -304,7 +304,7 @@ Knobs (env, for the runner process; defaults shown):
 | `PI_BRIDGE_WAKE_PERMANENT_AFTER` | `3` | give up earlier on `400/401/403/404/413` (a wrong secret will not pin the runner for 45 min) |
 | `PI_BRIDGE_WAKE_HTTP_TIMEOUT` | `15` | per-attempt timeout (capped at 30 s) |
 | `PI_BRIDGE_WAKE_PIWEB_BUDGET` | `3` | seconds spent building the optional `pi_web_url` link |
-| `PI_BRIDGE_DELIVERY_TIMEOUT` | `90` | origin-delivery hard timeout (also `delivery_timeout` in `wake.json`) |
+| `PI_BRIDGE_DELIVERY_TIMEOUT` | `240` | origin-delivery hard timeout (also `delivery_timeout` in `wake.json`) |
 | `PI_BRIDGE_DELIVERY_MAX_CHARS` | `1200` | size of the delivered summary (also `delivery_max_chars`) |
 | `PI_BRIDGE_HERMES_BIN` | — | absolute path of the `hermes` CLI used for delivery |
 
