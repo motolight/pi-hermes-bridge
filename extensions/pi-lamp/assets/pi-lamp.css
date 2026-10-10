@@ -1,0 +1,232 @@
+/* Pi Lamp — job counters for pi_delegate jobs, keyed to the origin chat. */
+
+/* A badge is a counter with a label, not a dot: "is Pi working, and how many?"
+   The stale-lamp indicator stays a plain dot (see .pilamp--stale). */
+.pilamp-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding: 0 6px;
+  height: 15px;
+  border-radius: 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  vertical-align: middle;
+  flex: 0 0 auto;
+  cursor: pointer;
+  outline-offset: 2px;
+  white-space: nowrap;
+  user-select: none;
+  background: rgba(138, 143, 152, 0.22);
+  color: #cfd4dc;
+  border: 1px solid rgba(138, 143, 152, 0.45);
+}
+
+/* at least one job running: blinking (per the spec) and unmissable */
+.pilamp-badge.pilamp--live {
+  background: rgba(56, 137, 253, 0.18);
+  border-color: #3889fd;
+  color: #cfe2ff;
+  animation: pilamp-blink 1.2s ease-in-out infinite;
+  box-shadow: 0 0 0 0 rgba(56, 137, 253, 0.45);
+}
+
+/* Nothing running, but unacknowledged failures are waiting */
+.pilamp-badge.pilamp--alert {
+  background: rgba(231, 76, 60, 0.16);
+  border-color: #e74c3c;
+  color: #ffd6d1;
+}
+
+/* nothing running, only finished work inside the day window */
+.pilamp-badge.pilamp--idle {
+  background: rgba(46, 204, 113, 0.14);
+  border-color: rgba(46, 204, 113, 0.7);
+  color: #c6f0d8;
+}
+
+/* Something IS running (the number counts those), but failures are waiting
+   behind them: the number stays the answer, a red pip says it is not clean. */
+.pilamp-badge.pilamp--problems { position: relative; }
+.pilamp-badge.pilamp--problems::after {
+  content: '';
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e74c3c;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+/* Snapshot is stale (writer stopped refreshing status.json): job state is
+   unknown, so show one muted, non-pulsing, non-interactive DOT. */
+.pilamp-badge.pilamp--stale {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 0;
+  background: #6b7280;
+  border: none;
+  opacity: 0.55;
+  animation: none;
+  box-shadow: none;
+  cursor: default;
+}
+
+@keyframes pilamp-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+#pilamp-titlebar {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+}
+#pilamp-titlebar .pilamp-badge { margin-left: 0; }
+
+/* ── detail card ─────────────────────────────────────────────────────── */
+.pilamp-card {
+  position: fixed;
+  z-index: 10050;
+  width: 340px;
+  max-width: calc(100vw - 16px);
+  padding: 10px 12px 12px;
+  border-radius: 10px;
+  background: var(--bg-secondary, #1c1f26);
+  color: var(--text-primary, #e8eaf0);
+  border: 1px solid var(--border-color, #333a46);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.pilamp-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.pilamp-card-title { font-weight: 600; }
+.pilamp-text--live { color: #6fb0ff; }
+.pilamp-text--alert { color: #ff8e80; }
+.pilamp-text--idle { color: #67d99a; }
+
+.pilamp-card-body {
+  max-height: min(62vh, 440px);
+  overflow-y: auto;
+}
+
+.pilamp-card-x {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+/* ── sections: running is open, everything else is collapsed ─────────── */
+.pilamp-sec + .pilamp-sec,
+.pilamp-sec + .pilamp-note { margin-top: 6px; }
+
+.pilamp-sec-head {
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.pilamp-sec-body { display: none; padding-left: 2px; }
+.pilamp-sec--open > .pilamp-sec-body { display: block; }
+
+.pilamp-item {
+  margin: 4px 0 6px;
+  padding: 5px 7px;
+  border-radius: 8px;
+  background: var(--bg-tertiary, #232833);
+  border-left: 3px solid transparent;
+}
+.pilamp-item--running    { border-left-color: #3889fd; }
+.pilamp-item--stalled    { border-left-color: #f5a623; }
+.pilamp-item--failed,
+.pilamp-item--interrupted { border-left-color: #e74c3c; }
+.pilamp-item--done       { border-left-color: rgba(46, 204, 113, 0.7); }
+.pilamp-item--cancelled  { border-left-color: #8a8f98; }
+
+.pilamp-item-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.pilamp-item-id {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.pilamp-item-sub {
+  opacity: 0.7;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.pilamp-dim  { opacity: 0.7; }
+.pilamp-warn { color: #f5a623; }
+.pilamp-err {
+  color: #ff9a90;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.pilamp-note {
+  display: block;
+  opacity: 0.6;
+  font-size: 11.5px;
+  margin: 4px 0;
+}
+
+.pilamp-ack {
+  margin-left: auto;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-color, #333a46);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+.pilamp-ack:hover { border-color: #4da3ff; }
+
+.pilamp-card-row {
+  display: flex;
+  gap: 8px;
+  margin: 2px 0;
+}
+.pilamp-card-link { color: #4da3ff; }
+.pilamp-card-ok {
+  margin-top: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border-color, #333a46);
+  background: var(--bg-tertiary, #262b35);
+  color: inherit;
+  cursor: pointer;
+}
+.pilamp-card-ok:hover { border-color: #4da3ff; }

@@ -1,0 +1,10 @@
+{
+  "id": "pi-lamp",
+  "name": "Pi Lamp",
+  "enabled": true,
+  "scripts": ["assets/pi-lamp.js"],
+  "stylesheets": ["assets/pi-lamp.css"],
+  "permissions": {
+    "storage": { "owned": true }
+  }
+}
