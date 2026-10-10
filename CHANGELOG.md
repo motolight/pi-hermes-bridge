@@ -5,8 +5,34 @@ the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
 the `V1.x` labels in the prose and in `docs/` name the bridge protocol
 revision, which is tracked independently of the package version.
 
-## Unreleased
+## 0.4.0 — 2026-10-10 (protocol V1.4, unchanged — fully backward-compatible)
 
+* **Runner: the Pi session dir is created before pi spawns (ENOENT fix).**
+  Pi aborts at startup with ENOENT when its standard-store session directory
+  for the spawn cwd (`~/.pi/agent/sessions/--<cwd-sanitized>--`) does not
+  exist yet. `pi_bridge/runner.py` now mirrors pi's own
+  `getDefaultSessionDirPath` naming and pre-creates the directory for every
+  non-legacy job (legacy jobs pass an explicit `--session-dir`, which pi
+  creates itself). New regression tests in `tests/test_session_dir.py`
+  cover creation, idempotence, `$HOME` resolution and the exact sanitization
+  pi performs (only `/`, `\` and `:` become `-`).
+* **`extensions/pi-lamp/`: pi_delegate live status badges in the Hermes
+  WebUI, now an official component of this repo.** A sidecar-free WebUI
+  extension: a read-only oneshot writer (`writer.py`, systemd timer, 10 s)
+  snapshots bridge job state into `status.json` served by the WebUI's own
+  authenticated static route, and `assets/pi-lamp.js` renders per-chat
+  counters (running / finished / failures) with a card, stall and
+  "stale lamp" detection and optional local PI WEB deep links. `manage.py`
+  installs/updates/rolls back the writer units and the merge-only WebUI
+  registration. All paths are env-overridable with `$HOME`-based defaults;
+  the writer never calls an LLM, writes nothing inside `PI_BRIDGE_HOME`, and
+  redacts filesystem paths from the snapshot. See
+  [`extensions/pi-lamp/README.md`](extensions/pi-lamp/README.md).
+* Protocol: **V1.4, unchanged** — v0.4.0 speaks exactly the protocol of
+  v0.3.0; jobs, wake payloads and `status.json` consumers of older releases
+  keep working, and v0.4.0 reads state written by older releases.
+* tests: 137 Python tests (134 previous + 3 session-dir regression) plus the
+  pi-lamp suite (66 Python, 71 JS assertions in `tests/js/smoke.js`).
 * docs: the manual static-route prompt in `docs/WAKE_SETUP.md` section 2 was a
   shortened V1.4 variant — it lacked the approval-gate circuit breaker ("do
   NOT retry or rephrase a gated call, end the turn"), `never sudo`, and

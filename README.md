@@ -165,6 +165,12 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   before.
 * **Safety** — no `shell=True`, task via stdin, argv only, generated job ids,
   bounded outputs, structured errors, secrets never stored in job state.
+* **Live WebUI status badges (optional, `extensions/pi-lamp/`)** — a
+  sidecar-free Hermes WebUI extension: a read-only 10 s writer snapshots job
+  state to `status.json`, and per-chat badges count running / finished /
+  failed `pi_delegate` jobs with a detail card, stall detection and optional
+  local PI WEB deep links. No new port, no sidecar, no LLM in the loop; see
+  [`extensions/pi-lamp/README.md`](extensions/pi-lamp/README.md).
 
 ## Pi orchestrator example
 
