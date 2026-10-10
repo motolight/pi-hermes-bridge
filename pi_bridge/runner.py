@@ -41,6 +41,38 @@ def standard_store_root() -> Path:
     return Path.home() / ".pi" / "agent" / "sessions"
 
 
+def pi_session_dir(cwd: str | Path,
+                   home: str | Path | None = None) -> Path:
+    """Pi's own session directory for `cwd` inside the standard store.
+
+    Mirrors pi's getDefaultSessionDirPath (core/session-manager.js):
+    the resolved absolute cwd, leading separator stripped, every
+    ``/``, ``\\`` and ``:`` replaced by ``-``, wrapped in ``--...--``,
+    under ``<home>/.pi/agent/sessions``.  ``home`` is the HOME the pi
+    child will actually see (its env_snapshot HOME), not necessarily
+    this process's.
+    """
+    resolved = os.path.realpath(str(cwd))
+    safe = re.sub(r"^[/\\]", "", resolved)
+    safe = re.sub(r"[/\\:]", "-", safe)
+    root = (Path(home) / ".pi" / "agent" / "sessions"
+            if home is not None else standard_store_root())
+    return root / f"--{safe}--"
+
+
+def ensure_pi_session_dir(cwd: str | Path,
+                          home: str | Path | None = None) -> Path:
+    """Create pi's session dir for `cwd` if missing (ENOENT guard).
+
+    Pi can abort at startup with ENOENT when its standard-store
+    directory for the spawn cwd does not exist yet (verified
+    2026-10-10); create it before spawning pi.
+    """
+    d = pi_session_dir(cwd, home)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _session_file_re(session_id: str) -> re.Pattern:
     """pi names session files ``<timestamp>_<session-id>.jsonl`` and its
     timestamp contains no underscore, so the prefix is matched exactly --
@@ -151,6 +183,13 @@ def run_turn(job_id: str, turn_n: int) -> int:
     for k, v in (job.get("env_snapshot") or {}).items():
         if k in ("PATH", "HOME", "LANG", "LC_ALL"):
             env[k] = v
+
+    # Pi dies with ENOENT at startup when its standard-store session
+    # dir for the spawn cwd is missing (verified 2026-10-10), so make
+    # sure it exists before spawning.  Legacy jobs are exempt: they
+    # pass an explicit --session-dir and pi creates that dir itself.
+    if not legacy_mode:
+        ensure_pi_session_dir(job["cwd"], home=env.get("HOME"))
 
     _log(jd, f"turn {turn_n} starting pi session={job['pi_session_id']} cwd={job['cwd']}")
 
