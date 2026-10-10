@@ -25,20 +25,42 @@ recover context without creating a duplicate delegate.
 1. `hermes plugins show pi-worker` and `hermes plugins list` — plugin enabled for
    the **gateway** profile (the woken run is a gateway run).
 2. Route exists and webhook platform enabled (`docs/WAKE_SETUP.md`).
-3. Secret matches between `~/.hermes/config.yaml` route and
-   `$PI_BRIDGE_HOME/wake.json` (mismatch → gateway logs 401).
+3. Secret matches between the route the wake POST goes to (static route in
+   `~/.hermes/config.yaml` **or** the dynamic subscription in
+   `~/.hermes/webhook_subscriptions.json`) and `$PI_BRIDGE_HOME/wake.json`
+   (mismatch → gateway logs 401). The POST goes to whichever route `wake.json`
+   `url` names.
 4. Wake delivery log for a job: `$PI_BRIDGE_HOME/jobs/<job_id>/runner.log`
-   (`wake tN:` lines); the current delivery state is in
-   `pi-bridge status <job> --json` under `.wake` (delivered / attempts /
-   last_error).
-5. `wake.json` `enabled: false` disables the channel instantly (no restart).
+   (`wake tN:` lines). Two different states live in
+   `pi-bridge status <job> --json`:
+   - `.wake` — the wake POST: `{enabled, delivered, attempts, last_error}`.
+     `delivered: true` means "the gateway accepted the event and started an
+     agent run", nothing about the user seeing anything.
+   - `.delivery` (V1.4) — the user-visible outcome: `{attempted, ok, kind,
+     channel, reason, error, turn, at}`, written by the runner itself.
+5. Kill switches, separately: `wake.json` `enabled: false` stops the wake POST
+   only; `origin_delivery: false` stops origin delivery only. Both take effect
+   on the next turn with no restart.
 
-## Woken run can't reply into the original WebUI conversation
+## Outcome never reached the WebUI conversation (V1.4: the runner delivers)
 
-Wake delivery resumes `HERMES_UI_SESSION_ID` with a short timeout. If the session
-is busy or owned elsewhere, the run must NOT wait and must NOT fall back to
-Telegram — the result stays durable in `pi_status`/logs and is reported on the
-next user turn. That is intended behavior, not a lost job.
+Since V1.4 the **runner** delivers the outcome along the job's origin
+(`hermes --resume <ui_session_id> chat -q … -Q --source tool` for `webui`,
+`hermes send -t <platform>:<chat_id>[:<thread_id>]` for messaging platforms);
+the woken run does a read-only acceptance check and never sends anything.
+Diagnose with `.delivery.reason`:
+
+| reason | meaning | what to do |
+|---|---|---|
+| `ok` | delivered | — |
+| `no-origin` / `no-delivery-channel` / `no-webui-session-id` / `no-chat-id` | nothing to deliver to (CLI-submitted or pre-V1.3 job, or `local`) | intended: log-only, the result stays in `pi_status` |
+| `session_not_owned` | the WebUI session is leased by a live process | intended fail-fast; no retry, no rerouting. Close the session in its surface if you want the announcement |
+| `timeout` | the resumed turn outran `delivery_timeout` (default 240 s) | a resume is a full agent turn; raise `delivery_timeout` for slow models / huge sessions |
+| `hermes-binary-not-found` / `not-runnable` | the runner cannot find `hermes` | set `hermes_bin` in `wake.json` to an absolute path (transient systemd units get a clean PATH) |
+| `cli-failed` / `session-not-found` / `session_not_owned`-class refusals | the CLI refused | see `.delivery.error`; `pi_status` remains the durable source |
+
+None of these change the job's status; the result is always durable in
+`pi_status` and `$PI_BRIDGE_HOME/jobs/<job_id>/final_result.md`.
 
 ## PI WEB doesn't show delegated sessions
 

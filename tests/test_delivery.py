@@ -372,6 +372,18 @@ def test_plan_uses_argv_never_shell(env, monkeypatch):
     assert not any("&" in a or "&&" in a for a in p["argv"] if a != text)
 
 
+def test_cli_supplied_reason_is_clamped(env, monkeypatch):
+    """A rogue/updated CLI must not be able to write an unbounded status field."""
+    from pi_bridge import deliver
+
+    monkeypatch.setenv("PI_BRIDGE_HOME", str(env["home"]))
+    long_reason = "A" * 10000
+    got = deliver._classify_returncode(
+        f"hermes-refusal-reason: {long_reason}\n")
+    assert got == "a" * 64          # bounded, lower-cased
+    assert deliver._classify_returncode("nothing here") == "cli-failed"
+
+
 def test_delivery_state_is_backward_compatible(env, monkeypatch):
     """Old job.json files (V1.3, no `delivery` key) still produce a view."""
     from pi_bridge import deliver

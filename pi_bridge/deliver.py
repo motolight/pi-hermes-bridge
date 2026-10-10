@@ -47,8 +47,10 @@ Configuration (same file as the wake notifier; `~/.local/state/pi-bridge/wake.js
      "delivery_timeout": 240,          # seconds, SIGTERM then SIGKILL
      "delivery_max_chars": 1200}       # size of the delivered summary
 
-`origin_delivery` defaults to **true** (a wake-enabled bridge delivers by
-origin).  The Hermes binary is discovered as `PI_BRIDGE_HERMES_BIN` >
+`origin_delivery` defaults to **true**, and it is **independent of the wake
+notifier**: `wake.json` `{"enabled": false}` silences the wake POST but not the
+delivery.  `"origin_delivery": false` is the kill switch for delivery (V1.3
+log-only behaviour).  The Hermes binary is discovered as `PI_BRIDGE_HERMES_BIN` >
 `hermes_bin` > `PATH`, so tests (and odd installs) can point it at a stub.
 The text is a plain summary; `MEDIA:` line prefixes and `[[as_document]]`
 are neutralised so a result can never turn into a file attachment.
@@ -65,6 +67,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import time
@@ -300,31 +303,52 @@ class _DeliveryTimeout(Exception):
     """The delivery CLI outran its hard budget (already terminated)."""
 
 
-def _run_bounded(argv: list, timeout: float) -> tuple:
-    """Run argv to completion, or terminate it at the deadline.
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the delivery CLI's whole process group.
 
-    Never a shell, never a queue: argv only, output captured, and a SIGTERM
-    before SIGKILL so the CLI can release its session lease and flush.
+    The hermes CLI may hand its pipes to a grandchild (client, gateway
+    connection); signalling only the direct child would then leave the pipes
+    open and `communicate()` blocked *after* the deadline -- precisely the
+    hang this budget exists to prevent.
+    """
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _run_bounded(argv: list, timeout: float) -> tuple:
+    """Run argv to completion, or terminate its process group at the deadline.
+
+    Never a shell, never a queue: argv only, output captured, own process
+    group, SIGTERM before SIGKILL, and a bounded drain after the kill so a
+    lingering descendant can never pin the runner past its budget.
     """
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL)
+                            stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, out or "", err or ""
     except subprocess.TimeoutExpired:
-        proc.terminate()
+        _signal_group(proc, signal.SIGTERM)
         try:
             proc.communicate(timeout=TERM_GRACE)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+            _signal_group(proc, signal.SIGKILL)
+            try:  # last bounded read; anything left is not worth waiting for
+                proc.communicate(timeout=TERM_GRACE)
+            except subprocess.TimeoutExpired:
+                pass
         raise _DeliveryTimeout()
 
 
 def _classify_returncode(stderr: str) -> str:
     """Map the CLI's typed refusal line to a reason code (no retry either way)."""
-    m = re.search(r"hermes-refusal-reason:\s*([A-Z_]+)", stderr or "")
+    m = re.search(r"hermes-refusal-reason:\s*([A-Z_]{1,64})", stderr or "")
     if m:
         return m.group(1).lower()
     if "Session not found" in (stderr or ""):

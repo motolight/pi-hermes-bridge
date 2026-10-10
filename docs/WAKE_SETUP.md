@@ -308,8 +308,12 @@ Knobs (env, for the runner process; defaults shown):
 | `PI_BRIDGE_DELIVERY_MAX_CHARS` | `1200` | size of the delivered summary (also `delivery_max_chars`) |
 | `PI_BRIDGE_HERMES_BIN` | — | absolute path of the `hermes` CLI used for delivery |
 
-`origin_delivery: false` in `wake.json` turns origin delivery off without
-touching the wake notifier (log-only, i.e. V1.3 behaviour).
+**Kill switches, and they are separate.** `wake.json` `enabled: false` stops
+the wake POST only; `origin_delivery: false` stops the origin delivery only.
+Origin delivery is **on by default** even when `wake.json` does not exist at
+all — if the runner can find a `hermes` CLI, jobs with a messaging/webui
+origin will be announced. To keep a bridge that never talks to any channel,
+set `origin_delivery: false` explicitly.
 
 ## 5. End-to-end verification
 
