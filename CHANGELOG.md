@@ -5,6 +5,42 @@ the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
 the `V1.x` labels in the prose and in `docs/` name the bridge protocol
 revision, which is tracked independently of the package version.
 
+## 0.4.1 — 2026-10-18 (protocol V1.5 — webui completion event)
+
+* **WebUI completion no longer runs a second agent turn (root-cause fix of
+  the completion race).** v0.4.0 delivered a finished job to a `webui`
+  origin by running `hermes --resume <sid> chat -q <result> -Q --source
+  tool` in a second process. That process contended with the live WebUI
+  backend over one session: with the lease held it failed instantly
+  (`SESSION_NOT_OWNED`, outcome never delivered); with the lease momentarily
+  free it persisted a user-role message and raced the backend's in-memory
+  history — and when the model call outran the delivery budget the runner
+  killed it, leaving an orphaned user-looking message with no assistant turn
+  until a browser reload. Now the runner only records a durable delivery
+  request next to the job (`webui_delivery.json`), and the bridge's Hermes
+  plugin — already running inside the Hermes process that hosts the session
+  — injects the completion into Hermes' own native background-completion
+  pipeline (async-delegation event + durable ledger + completion queue),
+  whose per-session notification poller starts a real acceptance turn at the
+  session's idle boundary: busy sessions back off instead of losing the
+  event, restarts replay pending completions, the durable claim prevents
+  duplicate acceptances, and `pi_status` remains the durable source of
+  truth. Messaging-platform delivery (`hermes send`) and the wake webhook
+  are unchanged. New: `pi_bridge/webui_event.py`, the spool branch of
+  `pi_bridge/deliver.py`, the poller in the `pi-worker` plugin, and
+  `docs/WEBUI_COMPLETION_EVENT_SPEC.md`.
+* **`pi_delegate` refuses already-truncated tasks.** Forensics (job
+  pb-20261018T194929Z-8726e2) showed the bridge transports task text
+  byte-exact (tool-call args == `job.json["task"]` == `turns/01.task.txt`
+  == the Pi session's first user message); the reported "truncation" was
+  upstream Hermes history compaction (`...[truncated]`) copied verbatim by
+  the delegating model into the tool-call argument. The bridge cannot
+  restore text compacted upstream, so it now refuses a task whose text ends
+  with a compaction marker (`task-text-truncated` error) instead of
+  launching a doomed job. A fidelity regression test submits a >50 KB task
+  ending in a unique sentinel and asserts byte-exact preservation across
+  plugin submit → `job.json` → turn file → runner input.
+
 ## 0.4.0 — 2026-10-10 (protocol V1.4, unchanged — fully backward-compatible)
 
 * **Runner: the Pi session dir is created before pi spawns (ENOENT fix).**

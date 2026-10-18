@@ -32,9 +32,13 @@ Policy (fixed, no configuration of routes)
 ------------------------------------------
 * `origin.platform` is a messaging platform -> `hermes send -t
   <platform>:<chat_id>[:<thread_id>] <text> -q`
-* `origin.platform == "webui"`           -> `hermes --resume <ui_session_id>
-  chat -q <text> -Q --source tool` (best-effort; a leased/unknown session is
-  a permanent failure, reported and never retried)
+* `origin.platform == "webui"` -> **no Hermes CLI at all** (V1.5): a durable
+  spool request is written into the job directory and the bridge's Hermes
+  plugin injects the completion into Hermes' own native background-completion
+  pipeline, in-process, in the backend that hosts the session.  Running
+  `hermes --resume ... chat -q` against a live webui session raced the
+  backend's lease and in-memory history and orphaned user-like messages --
+  see docs/WEBUI_COMPLETION_EVENT_SPEC.md.
 * origin empty, `local`, or an unknown platform -> deliver NOTHING anywhere.
   There is deliberately **no default channel and no Telegram fallback**.
 
@@ -72,7 +76,7 @@ import shutil
 import subprocess
 import time
 
-from . import state, wake
+from . import state, wake, webui_event
 
 # Platforms whose chats a human reads asynchronously; `hermes send` reaches
 # them by bot token.  Anything else is not a delivery target.
@@ -206,8 +210,25 @@ def plan(job: dict, hermes_bin: str, text: str) -> dict:
     """What delivery would look like for this job: {kind, channel, argv, reason}.
 
     `kind` is None for "deliver nowhere" (that is a *success* per policy, not
-    a failure: there simply is no user channel).
+    a failure: there simply is no user channel).  `argv` is None for
+    "webui-event": that delivery is a durable spool request consumed by the
+    bridge's Hermes plugin in-process (V1.5, see
+    docs/WEBUI_COMPLETION_EVENT_SPEC.md) -- it never runs a Hermes CLI and
+    needs no hermes binary.
     """
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+    platform = origin.get("platform") or ""
+    if platform == WEBUI_PLATFORM:
+        sid = origin.get("ui_session_id") or origin.get("chat_id") or ""
+        if not sid or not ID_RE.fullmatch(sid):
+            return {"kind": None, "channel": None, "argv": None,
+                    "reason": "no-webui-session-id"}
+        return {
+            "kind": "webui-event",
+            "channel": f"webui:{sid}",
+            "argv": None,
+            "reason": None,
+        }
     if not hermes_bin:
         return {"kind": None, "channel": None, "argv": None,
                 "reason": "hermes-binary-not-found"}
@@ -217,22 +238,6 @@ def plan(job: dict, hermes_bin: str, text: str) -> dict:
         # OSError from subprocess.
         return {"kind": None, "channel": None, "argv": None,
                 "reason": "hermes-binary-not-found"}
-    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
-    platform = origin.get("platform") or ""
-    if platform == WEBUI_PLATFORM:
-        sid = origin.get("ui_session_id") or origin.get("chat_id") or ""
-        if not sid or not ID_RE.fullmatch(sid):
-            return {"kind": None, "channel": None, "argv": None,
-                    "reason": "no-webui-session-id"}
-        return {
-            "kind": "webui-resume",
-            "channel": f"webui:{sid}",
-            # argv-only, no shell: the outcome text is one opaque argument
-            # and can never be re-read as a command line.
-            "argv": [hermes_bin, "--resume", sid, "chat", "-q", text, "-Q",
-                     "--source", "tool"],
-            "reason": None,
-        }
     if platform in MESSAGING_PLATFORMS:
         chat = origin.get("chat_id") or ""
         if not chat or not ID_RE.fullmatch(chat):
@@ -406,6 +411,27 @@ def _deliver(job_id: str, turn_n: int) -> dict:
                 at=state.now_iso())
         _log(jd, f"turn {turn_n} delivery: nothing delivered ({reason})")
         return {"ok": False, "reason": reason}
+
+    if p["kind"] == "webui-event":
+        # V1.5: never a second agent turn in a second process.  Record a
+        # durable request; the bridge plugin inside the Hermes process that
+        # hosts the session injects it into Hermes' native completion
+        # pipeline (webui_event module).  No subprocess, no lease contact.
+        status = "completed" if job.get("status") == "completed" \
+            else "failed"
+        goal = (f"Pi job {job_id} (turn {turn_n}): "
+                f"{' '.join((job.get('task') or '').split())[:120]}")
+        webui_event.write_request(
+            job_id, ui_session_id=p["channel"].split(":", 1)[1],
+            turn=turn_n, text=text, status=status,
+            goal=goal,
+            error=None if status == "completed" else
+            str(job.get("error") or job.get("status") or "failed"))
+        webui_event.record_queued(job_id, p["channel"])
+        _log(jd, f"turn {turn_n} delivery -> {p['channel']}: queued as a "
+                 "native completion event (no CLI resume, no retry)")
+        return {"ok": False, "reason": "queued", "channel": p["channel"],
+                "kind": "webui-event"}
 
     started = time.monotonic()
     _log(jd, f"turn {turn_n} delivery -> {p['channel']} ({p['kind']}, "

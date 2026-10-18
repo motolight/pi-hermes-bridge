@@ -144,14 +144,19 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
 * **Durable jobs** — per-job dir under `$PI_BRIDGE_HOME` (default
   `~/.local/state/pi-bridge`), atomic writes + flock, per-turn systemd units,
   restart-safe status reconciliation.
-* **Outcome delivery by origin (V1.4)** — after every terminal turn the runner
-  itself hands the result back along the job's recorded origin: `hermes send -t
-  <platform>:<chat_id>[:<thread_id>]` for messaging platforms, `hermes --resume
-  <ui_session_id> chat -q … -Q --source tool` for `webui`, and *nothing* for an
-  empty/unknown origin (no default channel, no Telegram fallback). argv only,
-  never a shell, hard timeout, no retries — so a result that merely looks like
-  a dangerous command cannot be stuck behind an approval gate nobody can answer
-  in a webhook session.
+* **Outcome delivery by origin (V1.5)** — after every terminal turn the
+  runner hands the result back along the job's recorded origin: `hermes send
+  -t <platform>:<chat_id>[:<thread_id>]` for messaging platforms; for `webui`
+  the runner never runs a Hermes CLI at all — it records a durable delivery
+  request next to the job, and the bridge's Hermes plugin injects the
+  completion into Hermes' own native background-completion pipeline inside
+  the process that hosts the session (a real acceptance turn at the idle
+  boundary, never a user-looking message, no session-lease contention; see
+  [`docs/WEBUI_COMPLETION_EVENT_SPEC.md`](docs/WEBUI_COMPLETION_EVENT_SPEC.md));
+  and *nothing* for an empty/unknown origin (no default channel, no Telegram
+  fallback). argv only, never a shell, hard timeout, no retries — so a result
+  that merely looks like a dangerous command cannot be stuck behind an
+  approval gate nobody can answer in a webhook session.
 * **Self-waking Hermes** — then the runner POSTs an HMAC-signed webhook to the
   local Hermes gateway; the woken run does a **read-only** acceptance check and
   either repairs (`pi_feedback`, ≤2 automatic loops) or ends. It never delivers
