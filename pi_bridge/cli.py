@@ -8,6 +8,7 @@ pi-bridge status   JOB_ID [--json] [--full]
 pi-bridge feedback JOB_ID [--feedback TEXT | --feedback-file F]  (default: on stdin)
 pi-bridge cancel   JOB_ID [--json]
 pi-bridge list     [--limit N] [--json]
+pi-bridge health   [--json]  (read-only poller health records, one row per live poller pid)
 pi-bridge web-info JOB_ID   (read-only PI WEB observability view, JSON)
 """
 from __future__ import annotations
@@ -134,6 +135,12 @@ def main(argv=None) -> int:
     wi.add_argument("--json", action="store_true",
                     help="accepted for symmetry; output is always JSON")
 
+    ht = sub.add_parser("health",
+                        help="read-only webui-poller health records "
+                             "(one row per live poller process)")
+    ht.add_argument("--json", action="store_true",
+                    help="dump the raw record list as JSON")
+
     args = ap.parse_args(argv)
     try:
         if args.cmd == "submit":
@@ -170,6 +177,40 @@ def main(argv=None) -> int:
         elif args.cmd == "web-info":
             job = state.load_job(args.job_id)
             print(json.dumps(bridge.piweb_view(job), ensure_ascii=False))
+        elif args.cmd == "health":
+            from . import health as health_mod
+            recs = health_mod.read_records(state.bridge_home())
+            if args.json:
+                print(json.dumps(recs, ensure_ascii=False))
+            elif not recs:
+                print("no live poller records")
+            else:
+                print(f"{'PID':>7}  {'ROLE':<12} {'VER':<7} "
+                      f"{'GATE':<16} {'HOST':<4} {'PEND':>4}  "
+                      f"{'LAST_TICK':<20} {'LAST_SCAN':<20} "
+                      f"{'LAST_INJ':<28} {'LAST_DEL':<28} "
+                      f"{'LAST_ABN':<28} {'ERR':<12} COUNTERS")
+                for r in recs:
+                    last = r.get("last") or {}
+                    c = r.get("counters") or {}
+                    err = (last.get("error") or {}).get("type") or "-"
+                    print(f"{r.get('pid', 0):>7}  "
+                          f"{str(r.get('role') or '-'):<12} "
+                          f"{str(r.get('plugin_version') or '-'):<7} "
+                          f"{str(r.get('last_gate_reason') or '-'):<16} "
+                          f"{str(bool(r.get('may_host'))):<4} "
+                          f"{int(r.get('last_pending_count') or 0):>4}  "
+                          f"{str(r.get('last_tick_at') or '-'):<20} "
+                          f"{str(r.get('last_scan_at') or '-'):<20} "
+                          f"{str(last.get('injected_job') or '-'):<28} "
+                          f"{str(last.get('delivered_job') or '-'):<28} "
+                          f"{str(last.get('abandoned_job') or '-'):<28} "
+                          f"{err:<12} "
+                          f"ticks={c.get('ticks', 0)} scans={c.get('scans', 0)} "
+                          f"inj={c.get('injected', 0)} "
+                          f"del={c.get('delivered', 0)} "
+                          f"abn={c.get('abandoned', 0)} "
+                          f"rej={c.get('gate_rejected', 0)}")
         elif args.cmd == "hermes-setup":
             from pathlib import Path as _Path
             from . import hermes_setup as hsetup

@@ -5,6 +5,55 @@ the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
 the `V1.x` labels in the prose and in `docs/` name the bridge protocol
 revision, which is tracked independently of the package version.
 
+## 0.4.2 — 2026-10-19 (protocol V1.5, unchanged — fully backward-compatible)
+
+* **The WebUI completion poller is no longer poisoned by lazy gateway
+  imports (production incident pb-20261019T082242Z-8d9299).** v0.4.1's host
+  gate vetoed any process with `gateway.run` in `sys.modules` — but the
+  WebUI backend hosts the agent in-process and its compression path
+  lazy-imports `gateway.run` (`agent/relay_runtime.py`), so the one
+  legitimate host permanently refused to inject: pending spool requests
+  were scanned and silently skipped, forever. The gate now decides by
+  PROCESS ROLE from persistent startup signals (argv / environment /
+  `__main__` script path): a real gateway runner (`-m hermes_cli.main
+  gateway run`, `hermes gateway run`, `-m gateway.run`) never injects —
+  argv-based, so the veto holds even before it imports anything — while a
+  positively identified WebUI backend (`HERMES_WEBUI_STATE_DIR`/
+  `HERMES_WEBUI_AGENT_DIR`, `hermes-webui/server.py`, or the webui-only
+  `api.background_process` module) injects even AFTER importing
+  `gateway.run`; `tui_gateway.server` alone grants nothing to a gateway,
+  and the session-lease fallback is preserved. Pinned by a parity table
+  across both gate twins and the exact incident regression (clean
+  completion, then poison, then completion still injects).
+* **The durable retry counter actually burns.** An injection that raised
+  was released back to `pending` with the ORIGINAL `attempts`, so a
+  permanently failing injector spun forever and the exhaustion branch was
+  unreachable. Every real injection attempt now persists `attempts + 1`
+  even on exception; repeated failures reach `abandoned`
+  (`injection-attempts-exhausted`, delivery acked `ok=false`) at the cap,
+  now overridable via `PI_BRIDGE_MAX_INJECTION_ATTEMPTS` (default 1200).
+  Attempts live in the spool file: a restart never resets them, and a
+  pending request left by a dead backend is picked up by the next poller
+  with its history intact.
+* **Poller observability — no more fully-silent failures.** Each poller
+  process keeps `$PI_BRIDGE_HOME/health/poller-<pid>.json` (0700/0600,
+  atomic: pid, detected role, host decision, loaded-module signals, last
+  tick/scan, pending count, gate reason, last injected/delivered/abandoned
+  job, last error type, counters; never task/result/session-id/secret
+  text), written on startup, on meaningful change and on a 60 s heartbeat
+  — never every 3 s tick — plus rate-limited `pi_worker` logs (start,
+  gate-reason transitions, one line per lifecycle event). New read-only
+  CLI: `pi-bridge health [--json]` (reader: `pi_bridge/health.py`).
+* **pi-lamp (writer 1.3): the lamp no longer lies green.** A completed
+  webui-origin job is AMBER "Pi done · waiting for Hermes" while the
+  native completion delivery is still queued, GREEN only once Hermes
+  actually acknowledged it (`delivery.ok`), and a failed/abandoned
+  delivery is a Problem (red, never time-quieted, Acknowledge-only). The
+  card shows the delivery state and reason; `status.json` gains an
+  additive `jobs[].hermes = {state, reason, kind}` field; old job shapes
+  and messaging (`send`) deliveries render exactly as before, and
+  Acknowledge stays purely browser-side.
+
 ## 0.4.1 — 2026-10-18 (protocol V1.5 — webui completion event)
 
 * **WebUI completion no longer runs a second agent turn (root-cause fix of

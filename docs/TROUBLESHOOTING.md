@@ -62,6 +62,32 @@ Diagnose with `.delivery.reason`:
 None of these change the job's status; the result is always durable in
 `pi_status` and `$PI_BRIDGE_HOME/jobs/<job_id>/final_result.md`.
 
+## WebUI completion stuck in `queued` / "the poller is silent"
+
+V1.5 webui delivery is done by the plugin's in-process poller, not by the
+runner.  Read-only diagnosis without touching a running process:
+
+```bash
+pi-bridge health          # one row per live poller process
+pi-bridge health --json
+```
+
+Each poller process (the WebUI backend, the gateway, any CLI that loads the
+plugin) writes `$PI_BRIDGE_HOME/health/poller-<pid>.json` (bookkeeping
+only: role, gate decision, last tick/scan, pending count, last
+injected/delivered/abandoned job, last error type, counters — never task
+or result text).  The v0.4.2 gate decides by process ROLE (argv/env/main
+script), not by which modules were lazily imported: the WebUI backend stays
+a valid host even after it lazy-imports `gateway.run` (the v0.4.1
+poisoning bug), while a gateway runner (`python -m hermes_cli.main gateway
+run` / `hermes gateway run` / `-m gateway.run`) never injects.  A record
+whose `role` is `gateway` and `may_host` is false is *expected* — there the
+request waits in the spool for the backend.  If NO live record has
+`may_host: true` while a request is pending, the hosting surface simply is
+not running (or does not load the plugin) — open/keep the WebUI session.
+Repeated failures burn the durable `attempts` counter in the request and
+end as `abandoned` at `PI_BRIDGE_MAX_INJECTION_ATTEMPTS` (default 1200).
+
 ## PI WEB doesn't show delegated sessions
 
 Observability is best-effort and read-only. Check `pi-bridge web-info <job>`

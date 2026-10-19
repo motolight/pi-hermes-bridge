@@ -164,6 +164,14 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   route).
 * **Recovery** — after any restart or lost model context, `pi_list` finds jobs;
   the wake client retries ~45 minutes through gateway restarts.
+* **Poller observability (V1.5, v0.4.2)** — the plugin's completion poller
+  decides hosting by *process role* (argv/env/main script, not lazy imports:
+  the WebUI backend stays a valid host even after it lazy-imports
+  `gateway.run`), burns a durable per-request `attempts` counter on every
+  real injection attempt, and keeps a per-pid health record under
+  `$PI_BRIDGE_HOME/health/` (role, gate decision, last tick/scan, pending
+  count, last lifecycle jobs, counters — never task/result text), read back
+  with the read-only `pi-bridge health [--json]`.
 * **Pi Web observability (optional, read-only)** — `pi-bridge web-info <job>`
   and the `pi_web` field report whether the job's Pi session is visible in PI
   WEB, with a deep link; when PI WEB is down the bridge behaves exactly as
@@ -174,7 +182,11 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   sidecar-free Hermes WebUI extension: a read-only 10 s writer snapshots job
   state to `status.json`, and per-chat badges count running / finished /
   failed `pi_delegate` jobs with a detail card, stall detection and optional
-  local PI WEB deep links. No new port, no sidecar, no LLM in the loop; see
+  local PI WEB deep links. Since writer 1.3 a finished webui-origin job is
+  amber ("Pi done · waiting for Hermes") until Hermes' native completion
+  delivery is acknowledged, green only then, and red when the delivery was
+  abandoned — the lamp no longer lies green about an unreceived result.
+  No new port, no sidecar, no LLM in the loop; see
   [`extensions/pi-lamp/README.md`](extensions/pi-lamp/README.md).
 
 ## Pi orchestrator example
@@ -200,7 +212,10 @@ always-on managed block in `SOUL.md` plus the portable
 
 ```bash
 .venv/bin/pi-bridge install            # discovery + capability check
-python -m pytest tests/ -q             # 134 tests: fake pi / fake PI WEB / fake webhook receiver / fake hermes + installer e2e
+pi-bridge health [--json]              # read-only poller observability (V1.5)
+python -m pytest tests/ -q             # full core suite: fake pi / fake PI WEB / fake webhook receiver / fake hermes + installer e2e
+python -m pytest extensions/pi-lamp/tests -q && \
+  node extensions/pi-lamp/tests/js/smoke.js extensions/pi-lamp/assets/pi-lamp.js <status.json>   # pi-lamp writer + browser reader
 ```
 
 ## Uninstall / rollback

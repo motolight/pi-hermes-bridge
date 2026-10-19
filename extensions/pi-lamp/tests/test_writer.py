@@ -187,6 +187,48 @@ def test_non_webui_origin_excluded(tmp_path):
     assert data["jobs"] == []
 
 
+def _drop_origin(d: Path, job: dict, value=None) -> None:
+    """Rewrite job.json with origin replaced (null / {} / whatever)."""
+    job["origin"] = value
+    (d / "job.json").write_text(json.dumps(job))
+
+
+def test_null_origin_visible_as_wildcard(tmp_path):
+    # The live bug: a running job with origin=null used to be dropped whole
+    # (session_keys [] -> job_view None), so the lamp never lit for it.
+    root = tmp_path / "bridge"
+    d, job = make_job(root, JOB_OK)          # running, alive runner
+    _drop_origin(d, job, None)
+    data = run_writer(tmp_path, root)
+    assert [j["sessions"] for j in data["jobs"]] == [["*"]]
+    j = data["jobs"][0]
+    assert j["view"] == "running" and j["group"] == "active"
+
+
+def test_null_origin_terminal_job_still_counted(tmp_path):
+    root = tmp_path / "bridge"
+    d, job = make_job(root, JOB_C, status="completed", updated=str(-3600),
+                      turns=_turns(finished_off=-3600))
+    _drop_origin(d, job, None)
+    data = run_writer(tmp_path, root)
+    assert [j["sessions"] for j in data["jobs"]] == [["*"]]
+    assert data["jobs"][0]["group"] == "recent"
+
+
+def test_empty_origin_wildcards_but_explicit_platforms_still_filter(tmp_path):
+    root = tmp_path / "bridge"
+    d, job = make_job(root, JOB_OK)
+    _drop_origin(d, job, {})                  # origin present but empty: same class as null
+    make_job(root, JOB_B, origin={"platform": "telegram", "chat_id": "123"})
+    make_job(root, JOB_C, status="completed", updated=str(-3600),
+             turns=_turns(finished_off=-3600))  # normal webui origin (sess-a)
+    data = run_writer(tmp_path, root)
+    by_id = {j["job_id"]: j for j in data["jobs"]}
+    assert JOB_B not in by_id                 # an explicit foreign origin stays invisible
+    assert by_id[JOB_OK]["sessions"] == ["*"]
+    assert by_id[JOB_C]["sessions"] == ["sess-a"]  # and is NOT merged into the wildcard
+
+
 def test_no_secrets_leak(tmp_path):
     root = tmp_path / "bridge"
     make_job(root, JOB_OK)
@@ -202,7 +244,7 @@ def test_error_paths_are_redacted(tmp_path):
     root = tmp_path / "bridge"
     make_job(root, JOB_OK, status="failed",
              error=("pi exited with code 1; stderr tail: ENOENT: no such file "
-                    "or directory, open '/home/u/.pi/agent/sessions/--home-u--/x.jsonl'"),
+                    "or directory, open '/home/hermes/.pi/agent/sessions/--home-hermes--/x.jsonl'"),
              turns=[{"n": 1, "kind": "task", "started_at": _iso(time.time() - 300),
                      "finished_at": _iso(time.time() - 100), "exit_code": 1}])
     data = run_writer(tmp_path, root)
@@ -217,7 +259,7 @@ def test_error_truncation_never_cuts_a_placeholder(tmp_path):
     """A very long path in `error` must be redacted and truncated without
     leaving a half-written "<path>" fragment or any path remnant."""
     root = tmp_path / "bridge"
-    long_err = "open '" + "/home/u/" + "d" * 300 + "/secret.txt'"
+    long_err = "open '" + "/home/hermes/" + "d" * 300 + "/secret.txt'"
     make_job(root, JOB_OK, status="failed", error=long_err,
              turns=[{"n": 1, "kind": "task", "started_at": _iso(time.time() - 300),
                      "finished_at": _iso(time.time() - 100), "exit_code": 1}])
@@ -410,7 +452,7 @@ def test_cache_is_shape_validated_and_private(tmp_path):
     loaded = mod.load_cache()
     assert set(loaded) == {"ok"}
 
-    mod.save_cache({"k": {"ts": 2.0, "map": {"/home/u": {"id": "p1"}}}})
+    mod.save_cache({"k": {"ts": 2.0, "map": {"/home/hermes": {"id": "p1"}}}})
     assert (cache_file.stat().st_mode & 0o077) == 0
 
     # projects_map survives a poisoned-by-hand cache without raising
@@ -428,11 +470,11 @@ def test_negative_answers_expire_but_links_survive(tmp_path):
     now = 1_000.0
     cache = {"__ws__p1": {"ts": now - 400.0, "id": "w1"}}   # expired for META_TTL_S
     # budget spent -> the stale answer is still returned
-    assert mod.workspace_id("http://127.0.0.1:1", "p1", "/home/u",
+    assert mod.workspace_id("http://127.0.0.1:1", "p1", "/home/hermes",
                             mod.Budget(-1), cache, now) == "w1"
     cache["__ws__p1"]["ts"] = now - 400.0
     # a real failure keeps the old id but shortens its life to NEG_TTL_S
-    wid = mod.workspace_id("http://127.0.0.1:1", "p1", "/home/u",
+    wid = mod.workspace_id("http://127.0.0.1:1", "p1", "/home/hermes",
                            mod.Budget(0.3), cache, now)
     assert wid == "w1"
     assert cache["__ws__p1"]["ttl"] == mod.NEG_TTL_S
@@ -589,3 +631,208 @@ def test_vanished_runner_never_counts_up_in_the_card(tmp_path):
     assert first["finished_at"] == second["finished_at"]
     assert first["duration_s"] == second["duration_s"]
     assert 8900 <= first["duration_s"] <= 9100   # created 3h ago, last update 30m ago
+
+
+# ─────────────────────── delivery honesty: did Hermes receive it? (1.3) ────
+#
+# For a webui-origin job `status == completed` only means Pi finished: the
+# bridge spools the completion as a `webui-event` and the in-browser Hermes
+# backend picks it up later.  Until that happens a green lamp is a lie, so the
+# writer publishes an additive per-job `hermes` = {state, reason, kind} with
+# state "delivered" | "awaiting" | "failed" | null, where null means "the
+# Hermes side is unknowable" (no delivery record, a synchronous `send`
+# delivery, a malformed record, writer/bridge version skew) and every consumer
+# must then render exactly what writer 1.2 rendered.
+
+def _writer_mod(name="pilamp_writer_delivery"):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, WRITER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _webui_event(reason, *, ok=False, attempted=True, channel="webui:sess-a"):
+    """A delivery record in the shape the bridge's webui_event module writes."""
+    return {"attempted": attempted, "ok": ok, "channel": channel,
+            "kind": "webui-event", "reason": reason, "error": None,
+            "turn": 1, "at": _iso(time.time())}
+
+
+def _completed(delivery=None, *, off=-5 * 3600, **kw):
+    """make_job() kwargs for a job finished long ago (past the quiet window).
+    `delivery` may be a raw record or just the reason of a webui-event one."""
+    if isinstance(delivery, str):
+        delivery = _webui_event(delivery)
+    out = dict(status="completed", updated=str(off), created=str(off - 600),
+               turns=_turns(finished_off=off))
+    if delivery is not None:
+        out["delivery"] = delivery
+    out.update(kw)
+    return out
+
+
+def test_version_is_bumped_for_delivery_honesty():
+    assert _writer_mod().VERSION == "1.3.0"
+
+
+def test_hermes_delivery_state_truth_table():
+    m = _writer_mod()
+    j = lambda d: {"status": "completed", "delivery": d}  # noqa: E731
+
+    # received: ok wins over any reason text
+    assert m.hermes_delivery_state(j(_webui_event("ok", ok=True))) == "delivered"
+    assert m.hermes_delivery_state(j({"attempted": True, "ok": "yes",
+                                      "kind": "webui-event", "reason": "ok"})) == "delivered"
+    # waiting: the event is queued (or the record simply carries no verdict)
+    for reason in ("queued", "", None):
+        assert m.hermes_delivery_state(j(_webui_event(reason))) == "awaiting", reason
+    # abandoned: Hermes will not take it any more -> a failure, not a wait
+    for reason in ("injection-attempts-exhausted", "native-delivery-exhausted",
+                   "no-webui-session-id"):
+        assert m.hermes_delivery_state(j(_webui_event(reason))) == "failed", reason
+
+    # unknowable shapes: never amber, never red, never a crash
+    assert m.hermes_delivery_state(j(None)) is None
+    assert m.hermes_delivery_state(j("garbage")) is None
+    assert m.hermes_delivery_state(j([])) is None
+    assert m.hermes_delivery_state(j({})) is None
+    assert m.hermes_delivery_state({"status": "completed"}) is None       # old job.json
+    assert m.hermes_delivery_state({}) is None
+    assert m.hermes_delivery_state(None) is None
+    assert m.hermes_delivery_state("nope") is None
+    # a synchronous send (telegram) is rendered exactly as it always was
+    for d in ({"attempted": True, "ok": True, "kind": "send", "channel": "telegram:1", "reason": "ok"},
+              {"attempted": True, "ok": False, "kind": "send", "channel": "telegram:1", "reason": "send-failed"},
+              {"attempted": True, "ok": False, "kind": None, "reason": "hermes-binary-not-found"},
+              {"attempted": False, "ok": False, "kind": None, "reason": None}):
+        assert m.hermes_delivery_state(j(d)) is None, d
+    # a never-attempted record with no verdict says nothing (writer 1.2 shape)
+    assert m.hermes_delivery_state(j({"attempted": False, "ok": False,
+                                      "kind": "webui-event", "reason": ""})) is None
+    # a terminal reason that also claims never to have been attempted is not a
+    # verdict either — an inconsistent record must not invent a red lamp
+    assert m.hermes_delivery_state(j(_webui_event("injection-attempts-exhausted",
+                                                  attempted=False))) is None
+    # an unknown reason code is neither a wait nor a failure
+    assert m.hermes_delivery_state(j(_webui_event("superseded"))) is None
+    assert m.hermes_delivery_state(j({"attempted": True, "ok": False,
+                                      "kind": "webui-event", "reason": 123})) is None
+
+
+def test_group_of_keeps_actionable_deliveries_visible():
+    m = _writer_mod()
+    old = 5 * 3600                       # past DONE_QUIET_S
+    assert m.group_of("done", old) == "quiet"             # 1.2 behaviour, unchanged
+    assert m.group_of("done", old, "delivered") == "quiet"
+    assert m.group_of("done", old, None) == "quiet"
+    assert m.group_of("done", old, "awaiting") == "recent"   # still actionable
+    assert m.group_of("done", old, "failed") == "recent"     # a failure, full stop
+    assert m.group_of("cancelled", old, "awaiting") == "recent"
+    # …but the 24 h day window still applies to a pending delivery
+    assert m.group_of("done", 30 * 3600, "awaiting") == "aged"
+    assert m.group_of("done", 30 * 3600, "failed") == "aged"
+
+
+def test_delivery_honesty_fields_on_the_snapshot(tmp_path):
+    """Four finished jobs of the same age, four different Hermes answers."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, **_completed("queued"))                        # amber
+    make_job(root, JOB_B, **_completed(_webui_event("ok", ok=True)))       # green
+    make_job(root, JOB_C, **_completed("injection-attempts-exhausted"))    # red
+    make_job(root, JOB_D, **_completed({"attempted": True, "ok": True,
+                                        "kind": "send", "channel": "telegram:1",
+                                        "reason": "ok"}))                  # as today
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert jobs[JOB_OK]["hermes"] == {"state": "awaiting", "reason": "queued",
+                                      "kind": "webui-event"}
+    assert jobs[JOB_B]["hermes"] == {"state": "delivered", "reason": "ok",
+                                     "kind": "webui-event"}
+    assert jobs[JOB_C]["hermes"] == {"state": "failed",
+                                     "reason": "injection-attempts-exhausted",
+                                     "kind": "webui-event"}
+    assert jobs[JOB_D]["hermes"] == {"state": None, "reason": "ok", "kind": "send"}
+    # grouping: only the truly-delivered and the synchronous ones quiet down
+    assert [jobs[k]["group"] for k in (JOB_OK, JOB_B, JOB_C, JOB_D)] == \
+        ["recent", "quiet", "recent", "quiet"]
+    # the view of every job is untouched: `hermes` is strictly additive
+    assert [jobs[k]["view"] for k in (JOB_OK, JOB_B, JOB_C, JOB_D)] == ["done"] * 4
+    # …and the 1.0 delivery block still has exactly its old keys
+    assert set(jobs[JOB_OK]["delivery"]) == {"attempted", "ok", "channel", "reason"}
+
+
+def test_abandoned_delivery_is_never_time_quieted(tmp_path):
+    root = tmp_path / "bridge"
+    for job_id, reason in ((JOB_OK, "injection-attempts-exhausted"),
+                           (JOB_B, "native-delivery-exhausted"),
+                           (JOB_C, "no-webui-session-id")):
+        make_job(root, job_id, **_completed(reason))
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    for job_id in (JOB_OK, JOB_B, JOB_C):
+        assert jobs[job_id]["hermes"]["state"] == "failed", job_id
+        assert jobs[job_id]["group"] == "recent", job_id   # Acknowledge is the only hide-off
+
+
+def test_awaiting_delivery_survives_the_quiet_window_but_not_the_day(tmp_path):
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, **_completed("queued", off=-5 * 3600))
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert jobs[JOB_OK]["group"] == "recent"
+    # the knob is still a knob: past the day window even a pending delivery stops counting
+    jobs = {j["job_id"]: j for j in
+            run_writer(tmp_path, root, notable_window_s="3600")["jobs"]}
+    assert jobs[JOB_OK]["group"] == "aged"
+
+
+def test_running_job_has_no_hermes_verdict(tmp_path):
+    """A queued/running job has no delivery answer yet: no `hermes` key."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, delivery=_webui_event("queued"))
+    j = {x["job_id"]: x for x in run_writer(tmp_path, root)["jobs"]}[JOB_OK]
+    assert j["group"] == "active"
+    assert "hermes" not in j
+
+
+def test_hermes_field_degrades_safely(tmp_path):
+    """Old/odd job shapes: `hermes.state` is null and nothing else changes."""
+    root = tmp_path / "bridge"
+    d, job = make_job(root, JOB_OK, **_completed("queued"))         # will lose delivery
+    make_job(root, JOB_B, **_completed({}))                          # empty record
+    make_job(root, JOB_C, **_completed(["garbage"]))                 # not a dict at all
+    make_job(root, JOB_D, **_completed({"attempted": True, "ok": True,
+                                        "kind": "carrier-pigeon", "reason": "ok"}))
+    (d / "job.json").write_text(json.dumps({k: v for k, v in job.items() if k != "delivery"}))
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    for job_id in (JOB_OK, JOB_B, JOB_C, JOB_D):
+        assert jobs[job_id]["hermes"]["state"] is None, job_id
+        assert jobs[job_id]["view"] == "done", job_id
+        assert jobs[job_id]["group"] == "quiet", job_id   # 5 h old: exactly writer 1.2
+
+
+def test_unfinished_jobs_keep_their_existing_view(tmp_path):
+    """A failed/interrupted job may well have a pending delivery record; it is
+    already a red problem row, so its view and group must not move — the
+    delivery state is only extra detail for the card."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, status="failed", updated=str(-5 * 3600), error="boom",
+             delivery=_webui_event("queued"),
+             turns=_turns(finished_off=-5 * 3600, exit_code=1))
+    make_job(root, JOB_B, status="cancelled", updated=str(-5 * 3600),
+             delivery=_webui_event("ok", ok=True),
+             turns=_turns(finished_off=-5 * 3600, exit_code=None))
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert jobs[JOB_OK]["view"] == "failed" and jobs[JOB_OK]["group"] == "recent"
+    assert jobs[JOB_OK]["hermes"]["state"] == "awaiting"     # reported, not re-grouped
+    assert jobs[JOB_B]["view"] == "cancelled" and jobs[JOB_B]["group"] == "quiet"
+    assert jobs[JOB_B]["hermes"]["state"] == "delivered"
+
+
+def test_abandoned_delivery_sorts_with_the_failures(tmp_path):
+    """The MAX_JOBS cut eats the tail of this ordering, so a completion Hermes
+    never received must never be dropped while a boring green row survives."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, **_completed("queued", off=-3000))                  # amber
+    make_job(root, JOB_B, **_completed(_webui_event("ok", ok=True), off=-3600))  # green
+    make_job(root, JOB_C, **_completed("native-delivery-exhausted", off=-4000))  # red
+    data = run_writer(tmp_path, root)
+    assert [j["job_id"] for j in data["jobs"]] == [JOB_C, JOB_OK, JOB_B]

@@ -44,7 +44,22 @@ REQUEST_NAME = "webui_delivery.json"
 STATUSES = ("pending", "inflight", "injected", "delivered", "abandoned",
             "unsupported")
 MAX_INFLIGHT_AGE_S = 120.0        # a crashed claimer must not wedge a request
-MAX_INJECTION_ATTEMPTS = 1200     # ~1 h at the plugin's 3 s tick
+
+
+def _max_attempts_default() -> int:
+    """PI_BRIDGE_MAX_INJECTION_ATTEMPTS (> 0) or the 1200 default (~1 h at
+    the plugin's 3 s tick); unparsable or non-positive values are garbage
+    and fall back to the default.  Read once at import; the module constant
+    MAX_INJECTION_ATTEMPTS stays patchable for tests."""
+    try:
+        val = int((os.environ.get("PI_BRIDGE_MAX_INJECTION_ATTEMPTS")
+                   or "").strip())
+    except (TypeError, ValueError):
+        return 1200
+    return val if val > 0 else 1200
+
+
+MAX_INJECTION_ATTEMPTS = _max_attempts_default()
 
 
 def _now_epoch() -> float:
@@ -340,26 +355,122 @@ def lease_owner(ui_session_id: str, hermes_home: Path | None = None):
 # per-session notification poller (tui_gateway.server).
 BACKEND_MARKERS = ("api.background_process", "tui_gateway.server")
 
+# ---------------------------------------------------------------------------
+# process-role gate (v0.4.2, incident pb-20261019T082242Z-8d9299)
+# ---------------------------------------------------------------------------
+# The v0.4.1 gate vetoed every process with "gateway.run" in sys.modules --
+# but the REAL WebUI backend lazily imports gateway.run in-process (agent/
+# relay_runtime.py via compression) after it has already hosted completions,
+# permanently poisoning its poller.  The role is therefore derived from
+# PERSISTENT process identity only (argv, environment, the __main__ file);
+# loaded modules are consulted only for processes with unknown argv
+# identity.  Parity with the plugin's _webui_* twins is pinned by
+# tests/test_webui_event_parity.py.
+WEBUI_IDENTITY_ENV = ("HERMES_WEBUI_STATE_DIR", "HERMES_WEBUI_AGENT_DIR")
 
-def may_host_session(ui_session_id: str, *, loaded_modules=None,
-                     hermes_home: Path | None = None) -> bool:
-    """True when THIS process can deliver the event natively:
-    it is the WebUI backend or a tui/desktop backend (BACKEND_MARKERS) and
-    NOT the gateway messaging runner -- the gateway imports
-    tui_gateway.server too (its hosted-room worker), and its delegation
-    watcher preflights foreign completions against the session DB and would
-    terminally DROP them.  Failing that, the process provably holds the
-    session's lease itself.  A gateway/CLI process hosting neither never
-    injects -- the request simply waits in the spool for the process that
-    does host the session."""
+
+def _norm_path(p) -> str:
+    return str(p or "").replace("\\", "/")
+
+
+def _path_ends(p, suffix) -> bool:
+    """True when the normalized path ends with `suffix` on a path-element
+    boundary ('x/gateway/run.py' yes, 'x/mygateway/run.py' no)."""
+    p = _norm_path(p)
+    return p == suffix or p.endswith("/" + suffix)
+
+
+def _argv_module(argv, name) -> bool:
+    """True when argv runs module `name` (`python -m name ...`)."""
+    argv = [str(a) for a in (argv or [])]
+    for i in range(len(argv) - 1):
+        if argv[i] == "-m" and argv[i + 1] == name:
+            return True
+    return False
+
+
+def _main_file_default() -> str:
+    import sys
+    mf = getattr(sys.modules.get("__main__"), "__file__", None) \
+        or (sys.argv[0] if sys.argv else "")
+    return str(mf or "")
+
+
+def process_role(argv=None, environ=None, main_file=None) -> str:
+    """'gateway' | 'webui' | 'tui_backend' | 'unknown' from PERSISTENT
+    process identity only (argv, environment, the __main__ file -- all
+    injectable for tests, defaults to the live process).  Gateway signals
+    first (veto before its lazy gateway.run import), then webui markers
+    (HERMES_WEBUI_* env, hermes-webui/server.py|bootstrap.py), then the
+    tui/desktop runner."""
+    import sys
+    if argv is None:
+        argv = sys.argv
+    if environ is None:
+        environ = os.environ
+    if main_file is None:
+        main_file = _main_file_default()
+    argv = [str(a) for a in (argv or [])]
+    mf = _norm_path(main_file)
+    is_hermes_cli = _argv_module(argv, "hermes_cli.main") \
+        or (argv and os.path.basename(argv[0]) == "hermes")
+    if (is_hermes_cli and "gateway" in argv[1:]) \
+            or "gateway.run" in argv or _path_ends(mf, "gateway/run.py"):
+        return "gateway"
+    if any(str(environ.get(k) or "").strip() for k in WEBUI_IDENTITY_ENV) \
+            or _path_ends(mf, "hermes-webui/server.py") \
+            or _path_ends(mf, "hermes-webui/bootstrap.py"):
+        return "webui"
+    if _argv_module(argv, "tui_gateway") \
+            or _argv_module(argv, "tui_gateway.entry") \
+            or _path_ends(mf, "tui_gateway/entry.py"):
+        return "tui_backend"
+    return "unknown"
+
+
+def host_decision(ui_session_id: str, *, loaded_modules=None,
+                  hermes_home: Path | None = None, argv=None, environ=None,
+                  main_file=None) -> tuple[bool, str]:
+    """(may_inject, reason) for THIS process (plugin-parity semantics):
+    1. an argv/env-identified gateway runner NEVER injects (its delegation
+       watcher terminally DROPS completions whose parent it cannot
+       resolve), regardless of loaded modules or a live session lease;
+    2. a positive webui identity (webui role OR api.background_process, a
+       hermes-webui-exclusive module) always hosts -- and MUST win over a
+       LATE incidental import of gateway.run (the production regression);
+    3. the tui/desktop backend role hosts;
+    4. unknown role: a loaded gateway.run still vetoes (v0.4.1 behaviour),
+       then the legacy BACKEND_MARKERS allow hosting;
+    5. finally the durable lease fallback: this process owns the session."""
     import sys
     mods = loaded_modules if loaded_modules is not None else sys.modules
+    role = process_role(argv=argv, environ=environ, main_file=main_file)
+    if role == "gateway":
+        return False, "gateway-runner"
+    if role == "webui" or "api.background_process" in mods:
+        return True, "webui-positive"
+    if role == "tui_backend":
+        return True, "tui-backend"
     if "gateway.run" in mods:
-        return False
+        return False, "gateway-run-loaded"
     if any(m in mods for m in BACKEND_MARKERS):
-        return True
+        return True, "backend-marker"
     owner = lease_owner(ui_session_id, hermes_home=hermes_home)
-    return bool(owner and owner[0] == os.getpid())
+    if owner and owner[0] == os.getpid():
+        return True, "lease-self"
+    return False, "no-host"
+
+
+def may_host_session(ui_session_id: str, *, loaded_modules=None,
+                     hermes_home: Path | None = None, argv=None,
+                     environ=None, main_file=None) -> bool:
+    """True when THIS process can deliver the event natively (the bool view
+    of host_decision; see there for the full role-gate semantics).  A
+    gateway/CLI process hosting neither never injects -- the request simply
+    waits in the spool for the process that does host the session."""
+    return host_decision(ui_session_id, loaded_modules=loaded_modules,
+                         hermes_home=hermes_home, argv=argv,
+                         environ=environ, main_file=main_file)[0]
 
 
 # ---------------------------------------------------------------------------

@@ -35,25 +35,18 @@ import time
 from pathlib import Path
 
 EXT_ID = "pi-lamp"
-VERSION = "1.1.0"
+VERSION = "1.3.0"  # registration version; tracks the writer (1.3.0 delivery honesty)
 SRC = Path(os.environ.get("PILAMP_SRC", str(Path(__file__).resolve().parent)))
 EXT_ROOT = Path(os.environ.get("PILAMP_EXT_ROOT",
                                str(Path.home() / ".hermes/webui/extensions/pi-lamp")))
-WEBUI_STATE_DIR = Path(os.environ.get(
-    "PILAMP_WEBUI_STATE_DIR",
-    str(Path.home() / ".hermes" / "webui"))).expanduser()
+WEBUI_STATE_DIR = Path(os.environ.get("PILAMP_WEBUI_STATE_DIR", "/home/hermes/.hermes/webui"))
 INSTALL_MANIFEST = WEBUI_STATE_DIR / "extension-install-manifest.json"
 OVERRIDES = WEBUI_STATE_DIR / "extension-overrides.json"
 STATUS_JSON = EXT_ROOT / "status.json"
 
 # Injectable so tests (and non-standard installs) can point every side effect
 # at a sandbox.  Defaults are the real host locations.
-BACKUP_ROOT = Path(os.environ.get(
-    "PI_LAMP_BACKUP_DIR", str(Path.home() / "backups"))).expanduser()
-# pi-bridge state the writer reads (same variable writer.py honours).
-BRIDGE_HOME = Path(os.environ.get(
-    "PI_LAMP_BRIDGE_HOME",
-    str(Path.home() / ".local" / "state" / "pi-bridge"))).expanduser()
+BACKUP_ROOT = Path(os.environ.get("PI_LAMP_BACKUP_DIR", "/home/hermes/backups"))
 UNITS_DIR = Path(os.environ.get("PI_LAMP_UNITS_DIR",
                                 str(Path.home() / ".config/systemd/user")))
 SYSTEMCTL_BIN = shlex.split(os.environ.get("PI_LAMP_SYSTEMCTL", "systemctl"))
@@ -187,7 +180,7 @@ Description=Pi Lamp writer - pi-bridge job status snapshot for the WebUI
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 {WRITER}
-Environment=PI_BRIDGE_HOME={BRIDGE_HOME}
+Environment=PI_BRIDGE_HOME=/home/hermes/.local/state/pi-bridge
 Environment=PI_LAMP_OUT={STATUS_JSON}
 Environment=PI_LAMP_STALL_S={STALL_S}
 Environment=PI_LAMP_DONE_QUIET_S={DONE_QUIET_S}

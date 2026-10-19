@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import queue
+import sys
 import time
 from pathlib import Path
 
@@ -64,6 +65,13 @@ def pair(tmp_path, monkeypatch):
                         "turns": [{"n": 1}], "final_result": "ok",
                         "delivery": {}}))
     monkeypatch.setenv("PI_BRIDGE_HOME", str(home))
+    # deterministic constants: no ambient attempt-cap override
+    monkeypatch.delenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", raising=False)
+    # the gate table below passes identity inputs explicitly; keep the
+    # ambient environment out of any default-arg decision
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     return webui_event, _load_plugin()
 
 
@@ -287,3 +295,115 @@ def test_release_drops_a_stale_reason_identically_in_both(pair):
     out2 = mod._webui_release(mod._webui_claim(scanned[0]), "pending")
     assert "reason" not in out2
     assert "reason" not in we.read_request(state.job_dir(JOB_ID))
+
+
+# ---------------------------------------------------------------------------
+# v0.4.2 process-role host gate: one shared decision table, both twins
+# ---------------------------------------------------------------------------
+# (argv, environ, main_file, loaded modules, lease, want_host, want_reason)
+# lease: None (no lease file), "self" (this pid), "other" (a foreign pid)
+GATE_TABLE = [
+    # gateway runner: argv-identified, vetoed regardless of modules/lease
+    (["/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"],
+     {}, "", ("gateway.run", "tui_gateway.server"), None,
+     False, "gateway-runner"),
+    (["/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"],
+     {}, "", ("tui_gateway.server",), "self",
+     False, "gateway-runner"),
+    (["/h/venv/bin/hermes", "gateway", "run"], {}, "/h/venv/bin/hermes",
+     ("gateway.run", "tui_gateway.server"), None, False, "gateway-runner"),
+    (["/venv/bin/python", "-m", "gateway.run"], {}, "", (), None,
+     False, "gateway-runner"),
+    ([], {}, "/opt/hermes/gateway/run.py", (), None, False, "gateway-runner"),
+    # gateway signals are checked FIRST: webui env cannot launder a gateway
+    (["/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"],
+     {"HERMES_WEBUI_STATE_DIR": "/s"}, "", (), None, False,
+     "gateway-runner"),
+    # positive webui identity survives the late gateway.run import
+    ([], {"HERMES_WEBUI_STATE_DIR": "/s"}, "", ("gateway.run",), None,
+     True, "webui-positive"),
+    ([], {"HERMES_WEBUI_AGENT_DIR": "/a"}, "",
+     ("gateway.run", "tui_gateway.server"), None,
+     True, "webui-positive"),
+    ([], {}, "/srv/hermes-webui/server.py", ("gateway.run",), None,
+     True, "webui-positive"),
+    ([], {}, "/srv/hermes-webui/bootstrap.py", (), None,
+     True, "webui-positive"),
+    ([], {}, "", ("api.background_process", "gateway.run"), None,
+     True, "webui-positive"),
+    # tui/desktop backend role
+    (["/venv/bin/python", "-m", "tui_gateway.entry"], {}, "", (), None,
+     True, "tui-backend"),
+    (["/venv/bin/python", "-m", "tui_gateway"], {}, "", (), "other",
+     True, "tui-backend"),
+    ([], {}, "/app/tui_gateway/entry.py", (), None, True, "tui-backend"),
+    # unknown role: the legacy module view (v0.4.1 behaviour preserved)
+    ([], {}, "", ("tui_gateway.server",), None, True, "backend-marker"),
+    ([], {"HERMES_WEBUI_STATE_DIR": ""}, "", ("gateway.run",), None,
+     False, "gateway-run-loaded"),
+    ([], {}, "", ("gateway.run", "tui_gateway.server"), "self",
+     False, "gateway-run-loaded"),
+    # unknown role, no modules: the durable lease fallback
+    ([], {}, "", (), "self", True, "lease-self"),
+    ([], {}, "", (), "other", False, "no-host"),
+    ([], {}, "", (), None, False, "no-host"),
+]
+
+
+@pytest.mark.parametrize(
+    "argv,environ,main_file,modules,lease,want_host,want_reason",
+    GATE_TABLE, ids=[row[6] for row in GATE_TABLE])
+def test_host_gate_decisions_are_identical(pair, monkeypatch, tmp_path,
+                                           argv, environ, main_file,
+                                           modules, lease, want_host,
+                                           want_reason):
+    """The plugin's live-process decision and the module's pure decision must
+    return the SAME (host, reason) for the SAME identity inputs: identity
+    explicitly, fake modules via sys.modules (the plugin reads the real
+    one), the lease through one shared HERMES_HOME registry."""
+    we, mod = pair
+    hh = tmp_path / "gate-hermes"
+    if lease is not None:
+        pid = os.getpid() if lease == "self" else 999999
+        d = hh / "runtime"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "active_sessions.json").write_text(json.dumps(
+            {"entries": [{"session_id": SID, "pid": pid,
+                          "surface": "webui"}]}), "utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hh))
+    for m in modules:
+        monkeypatch.setitem(sys.modules, m, type(sys)(m))
+
+    got_plugin = mod._webui_host_decision(SID, argv=argv, environ=environ,
+                                          main_file=main_file)
+    got_module = we.host_decision(SID, loaded_modules=set(modules),
+                                  hermes_home=hh, argv=argv,
+                                  environ=environ, main_file=main_file)
+    assert got_plugin == (want_host, want_reason)
+    assert got_module == (want_host, want_reason)
+    # the bool wrappers agree with the decisions too
+    assert we.may_host_session(SID, loaded_modules=set(modules),
+                               hermes_home=hh, argv=argv, environ=environ,
+                               main_file=main_file) is want_host
+
+
+@pytest.mark.parametrize("argv,environ,main_file,want", [
+    (["/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"], {},
+     "", "gateway"),
+    (["/h/bin/hermes", "gateway", "run"], {}, "/h/bin/hermes", "gateway"),
+    (["/venv/bin/python", "-m", "gateway.run"], {}, "", "gateway"),
+    ([], {}, "/opt/hermes/gateway/run.py", "gateway"),
+    ([], {"HERMES_WEBUI_STATE_DIR": "/s"}, "/venv/bin/pytest", "webui"),
+    ([], {}, "/srv/hermes-webui/bootstrap.py", "webui"),
+    (["/venv/bin/python", "-m", "tui_gateway.entry"], {}, "", "tui_backend"),
+    ([], {}, "/app/tui_gateway/entry.py", "tui_backend"),
+    (["/venv/bin/python", "-m", "pytest", "tests"], {}, "/venv/bin/pytest",
+     "unknown"),
+])
+def test_process_role_is_the_same_function(pair, argv, environ, main_file,
+                                           want):
+    we, mod = pair
+    assert we.process_role(argv=argv, environ=environ,
+                           main_file=main_file) == want
+    assert mod._webui_process_role(argv=argv, environ=environ,
+                                   main_file=main_file) == want

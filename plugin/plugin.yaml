@@ -1,5 +1,5 @@
 name: pi-worker
-version: 0.4.1
+version: 0.4.2
 description: >-
   Delegate coding tasks to the Pi orchestrator through the durable
   pi-bridge (pi_delegate / pi_status / pi_feedback / pi_cancel / pi_list).

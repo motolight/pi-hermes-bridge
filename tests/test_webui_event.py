@@ -375,6 +375,94 @@ def test_may_host_is_false_when_the_registry_is_unreadable(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# v0.4.2 process-role gate (pure twin of the plugin's role-aware decision)
+# ---------------------------------------------------------------------------
+
+GW_ARGV = ["/h/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"]
+
+
+def test_webui_role_from_env_beats_a_late_gateway_run_import(tmp_path):
+    """The production regression: a webui host identified purely by
+    HERMES_WEBUI_STATE_DIR (argv = pytest's) must still host after
+    gateway.run has been lazily imported."""
+    mods = {"gateway.run", "tui_gateway.server"}
+    assert webui_event.host_decision(
+        SID, loaded_modules=mods, hermes_home=tmp_path / "missing",
+        argv=["/venv/bin/pytest", "tests"],
+        environ={"HERMES_WEBUI_STATE_DIR": "/srv/webui"},
+        main_file="/venv/bin/pytest") == (True, "webui-positive")
+    assert webui_event.process_role(
+        argv=["/venv/bin/pytest", "tests"],
+        environ={"HERMES_WEBUI_AGENT_DIR": "/srv/agent"},
+        main_file="/venv/bin/pytest") == "webui"
+    # api.background_process is hermes-webui-exclusive: a positive module
+    # signal survives the late gateway.run import as well
+    assert webui_event.host_decision(
+        SID, loaded_modules=mods | {"api.background_process"},
+        hermes_home=tmp_path / "missing",
+        argv=["/venv/bin/pytest"], environ={},
+        main_file="/venv/bin/pytest") == (True, "webui-positive")
+
+
+def test_gateway_argv_vetoes_before_any_lazy_import(tmp_path):
+    """role 'gateway' from argv alone -> never inject, even with a lease
+    held by THIS pid and no gateway.run imported yet."""
+    hh = tmp_path / "hermes-home"
+    write_lease(hh, [{"session_id": SID, "pid": os.getpid(),
+                      "surface": "webui"}])
+    for argv in (GW_ARGV,
+                 ["/h/venv/bin/hermes", "gateway", "run"],
+                 ["/h/venv/bin/python", "-m", "gateway.run"]):
+        assert webui_event.host_decision(
+            SID, loaded_modules={"tui_gateway.server"},
+            hermes_home=hh, argv=argv, environ={},
+            main_file="/h/venv/bin/python") == (False, "gateway-runner")
+
+
+def test_tui_backend_role_hosts(tmp_path):
+    assert webui_event.process_role(
+        argv=["/h/venv/bin/python", "-m", "tui_gateway.entry"],
+        environ={}, main_file="") == "tui_backend"
+    assert webui_event.host_decision(
+        SID, loaded_modules=set(), hermes_home=tmp_path / "missing",
+        argv=["/h/venv/bin/python", "-m", "tui_gateway"], environ={},
+        main_file="") == (True, "tui-backend")
+
+
+def test_may_host_session_and_host_decision_agree_on_wrappers(tmp_path):
+    hh = tmp_path / "hermes-home"
+    write_lease(hh, [{"session_id": SID, "pid": os.getpid(),
+                      "surface": "webui"}])
+    assert webui_event.may_host_session(
+        SID, loaded_modules=set(), hermes_home=hh, argv=[], environ={},
+        main_file="") is True                       # lease-self
+    assert webui_event.may_host_session(
+        SID, loaded_modules={"gateway.run"}, hermes_home=hh, argv=[],
+        environ={}, main_file="") is False          # gateway-run-loaded
+
+
+# ---------------------------------------------------------------------------
+# v0.4.2 attempt-budget cap: env override, garbage fallback, patchable
+# ---------------------------------------------------------------------------
+
+def test_max_attempts_env_override(monkeypatch):
+    monkeypatch.setenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", "5")
+    assert webui_event._max_attempts_default() == 5
+    monkeypatch.setenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", "garbage")
+    assert webui_event._max_attempts_default() == 1200
+    monkeypatch.setenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", "0")
+    assert webui_event._max_attempts_default() == 1200
+    monkeypatch.delenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", raising=False)
+    assert webui_event._max_attempts_default() == 1200
+
+
+def test_attempts_cap_constant_is_patchable_for_tests(monkeypatch, home):
+    monkeypatch.setattr(webui_event, "MAX_INJECTION_ATTEMPTS", 3)
+    assert webui_event.attempts_exhausted({"attempts": 2}) is False
+    assert webui_event.attempts_exhausted({"attempts": 3}) is True
+
+
+# ---------------------------------------------------------------------------
 # job.json bookkeeping written by the runner / the poller
 # ---------------------------------------------------------------------------
 

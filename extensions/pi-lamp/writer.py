@@ -16,6 +16,13 @@ space.  Groups are additive: an older reader keeps using `view`, and an older
 status.json (no group/finished_at) still renders client-side from `view` +
 `updated_at`.
 
+Since 1.3 a terminal job also carries `hermes` = {state, reason, kind} —
+whether HERMES itself received the completion (the bridge's asynchronous
+`webui-event` delivery path).  state is "delivered" | "awaiting" | "failed",
+or null when the Hermes side is unknowable (no delivery record, a `send`
+/telegram delivery, an unrecognised shape): the lamp then renders exactly as
+it did in 1.2.
+
 Output (atomic): PI_LAMP_OUT (default
 ~/.hermes/webui/extensions/pi-lamp/status.json), fetched by the pi-lamp
 extension JS same-origin at /extensions/pi-lamp/status.json.
@@ -34,7 +41,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 
 JOB_ID_RE = re.compile(r"^pb-\d{8}T\d{6}Z-[0-9a-f]{6}$")
 UNIT_RE = re.compile(r"^pi-bridge-pb-\d{8}T\d{6}Z-[0-9a-f]{6}-t\d{1,4}$")
@@ -464,8 +471,20 @@ def piweb_view(job: dict, cache: dict, now: float, budget: Budget) -> dict | Non
 
 # ---------------------------------------------------------------- job view
 
+# A job with no origin info at all (origin null / missing / empty) is not
+# thrown away: it lands in the pseudo-session "*", whose badge lights in
+# every chat window.  On this solo-user, loopback-only box a live job that
+# nobody can attribute is still news; an *explicit* non-webui origin stays
+# invisible (see session_keys).  The browser resolves "*" as a fallback
+# bucket, and the job is stored under the single key "*", so it is never
+# counted twice.
+WILDCARD_SESSION = "*"
+
+
 def session_keys(job: dict) -> list[str]:
-    origin = job.get("origin") or {}
+    origin = job.get("origin")
+    if not isinstance(origin, dict) or not origin:
+        return [WILDCARD_SESSION]  # null / missing / empty origin: visible everywhere
     if origin.get("platform") != "webui":
         return []
     keys = []
@@ -540,21 +559,81 @@ def finished_ts(job: dict, turns: list[dict]) -> float | None:
     return best or None
 
 
-def group_of(view: str, finished_age_s: float | None) -> str:
+# ---------------------------------------------------------------- delivery honesty
+#
+# Green used to mean "the Pi job finished".  For a job that came from the
+# WebUI that is only half the answer: what the user actually asks is whether
+# Hermes ever *received* the completion.  The bridge records that in
+# job["delivery"] = {attempted, ok, channel, kind, reason, error, turn, at}.
+# kind "webui-event" is the asynchronous path — the completion event is
+# spooled, then the bridge plugin hands it to the in-browser Hermes backend —
+# so between "finished" and "received" there is a real, observable waiting
+# state.  kind "send" (telegram) is synchronous, and a job with no delivery
+# record (old jobs, writer/bridge version skew) must degrade to exactly
+# writer 1.2's rendering.
+
+HERMES_DELIVERY_KIND = "webui-event"
+# The event is recorded and waits for the browser-side picker (or the record
+# simply carries no verdict yet): a wait, not a failure.
+HERMES_PENDING_REASONS = frozenset({"queued", "", None})
+# Hermes will not take it any more: that is a failure, and failures are only
+# ever hidden by Acknowledge.
+HERMES_TERMINAL_REASONS = frozenset({
+    "injection-attempts-exhausted",
+    "native-delivery-exhausted",
+    "no-webui-session-id",
+})
+# States the card must keep visible regardless of age (never `quiet`).
+HERMES_ACTIONABLE_STATES = frozenset({"awaiting", "failed"})
+
+
+def hermes_delivery_state(job) -> str | None:
+    """delivered | awaiting | failed | None for one raw job dict (pure).
+
+    None means "the Hermes side is unknowable" — no delivery record, a
+    malformed one, a synchronous delivery (kind "send"), or a blank legacy
+    record — and every consumer must then render exactly what writer 1.2
+    rendered: no amber, no red reclassification, no crash.
+    """
+    if not isinstance(job, dict):
+        return None
+    d = job.get("delivery")
+    if not isinstance(d, dict) or d.get("kind") != HERMES_DELIVERY_KIND:
+        return None                       # send/telegram, or no answer at all
+    reason = d.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return None                       # malformed: unknowable, never a guess
+    if not d.get("attempted") and reason != "queued":
+        return None                       # a never-attempted record says nothing
+    if d.get("ok"):
+        return "delivered"
+    if reason in HERMES_TERMINAL_REASONS:
+        return "failed"
+    if reason in HERMES_PENDING_REASONS:
+        return "awaiting"
+    return None                           # an unknown reason code: no opinion
+
+
+def group_of(view: str, finished_age_s: float | None, hermes_state: str | None = None) -> str:
     """UI group, decided once by the writer's clock:
       active – running/stalled, always listed;
       recent – terminal and still worth a row in the card;
       quiet  – finished (done/cancelled) a while ago: counted in the badge,
                no longer takes card space;
       aged   – terminal and older than the day: neither counted nor listed.
-    Failures are never `quiet`: acknowledging is the only way to hide them."""
+    Failures are never `quiet`: acknowledging is the only way to hide them.
+    Neither is a completion Hermes has not received (`awaiting`) or will never
+    receive (`failed`) — both are still actionable, so the auto-hide that
+    applies to a plain finished job does not apply to them (the aged window
+    still does)."""
     if view in ACTIVE_VIEWS:
         return "active"
     if finished_age_s is None:
         return "recent"           # unknown age: show it rather than hide it
     if finished_age_s > NOTABLE_WINDOW_S:
         return "aged"
-    if view in QUIET_VIEWS and finished_age_s > DONE_QUIET_S:
+    if (view in QUIET_VIEWS and finished_age_s > DONE_QUIET_S
+            and hermes_state not in HERMES_ACTIONABLE_STATES):
         return "quiet"
     return "recent"
 
@@ -620,8 +699,13 @@ def job_view(job_dir: Path, job: dict, now: float, cache: dict, budget: Budget) 
         if (now - upd) > RESULT_TTL_S:
             return None
 
-    delivery = job.get("delivery") or {}
-    wake = job.get("wake") or {}
+    raw_delivery = job.get("delivery")
+    # A hand-edited or half-written job.json must never cost a snapshot tick
+    # (main() only catches OSError/ValueError, so anything raising here would
+    # kill the whole status.json update).
+    delivery = raw_delivery if isinstance(raw_delivery, dict) else {}
+    raw_wake = job.get("wake")
+    wake = raw_wake if isinstance(raw_wake, dict) else {}
     out = {
         "job_id": job.get("job_id"),
         "view": view,
@@ -657,7 +741,14 @@ def job_view(job_dir: Path, job: dict, now: float, cache: dict, budget: Budget) 
         fts = finished_ts(job, turns)
         out["finished_at"] = iso(fts) if fts else None
         out["finished_age_s"] = round(max(0.0, now - fts), 1) if fts else None
-        out["group"] = group_of(view, out["finished_age_s"])
+        # Did Hermes get the completion?  Additive: `view`/`group` semantics
+        # for every non-webui-event job are untouched, and an active job has
+        # no delivery answer yet, so it carries no `hermes` field at all.
+        hstate = hermes_delivery_state(job)
+        out["hermes"] = {"state": hstate,
+                         "reason": delivery.get("reason"),
+                         "kind": delivery.get("kind")}
+        out["group"] = group_of(view, out["finished_age_s"], hstate)
     try:
         pwv = piweb_view(job, cache, now, budget)
     except Exception:
@@ -693,9 +784,19 @@ def main() -> int:
                 break
     order = {"stalled": 0, "running": 1, "interrupted": 2, "failed": 3, "cancelled": 4, "done": 5}
     gorder = {"active": 0, "recent": 1, "quiet": 2, "aged": 3}
+
+    def view_rank(v: dict) -> int:
+        # A completion Hermes never received is a problem, not finished work:
+        # it must sort with the failures, so the MAX_JOBS cut never drops it
+        # while keeping boring green rows.
+        h = v.get("hermes")
+        if isinstance(h, dict) and h.get("state") == "failed":
+            return order["failed"]
+        return order.get(v["view"], 9)
+
     # active jobs first, then the still-interesting terminal ones; the MAX_JOBS
     # cut therefore drops the oldest/least interesting tail, not the work.
-    views.sort(key=lambda v: (gorder.get(v["group"], 9), order.get(v["view"], 9),
+    views.sort(key=lambda v: (gorder.get(v["group"], 9), view_rank(v),
                               -(parse_iso(v.get("updated_at")) or 0)))
     views = views[:MAX_JOBS]
     payload = {"generated_at": now_iso(), "writer_version": VERSION,

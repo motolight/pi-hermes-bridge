@@ -349,12 +349,32 @@ _HANDLERS = {
 # two implementations against shared fixtures.
 _WEBUI_POLL_SECONDS = 3.0
 _WEBUI_INFLIGHT_STALE_S = 120.0
-_WEBUI_MAX_ATTEMPTS = 1200   # ~1 h at the 3 s tick
+_PLUGIN_VERSION = "0.4.2"    # keep in sync with pyproject.toml project.version
+_WEBUI_PROTOCOL = "V1.5"
+_DEFAULT_MAX_ATTEMPTS = 1200   # ~1 h at the 3 s tick
+
+
+def _env_int(name, default):
+    """Positive-int env override; anything unparsable or <= 0 is garbage."""
+    try:
+        val = int((os.environ.get(name) or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+_WEBUI_MAX_ATTEMPTS = _env_int("PI_BRIDGE_MAX_INJECTION_ATTEMPTS",
+                               _DEFAULT_MAX_ATTEMPTS)
 _request_name = "webui_delivery.json"
+
+
+_home_pin = None  # captured at poller-thread start (see _start_webui_poller)
 
 
 def _bridge_home():
     from pathlib import Path
+    if _home_pin is not None:
+        return _home_pin
     home = os.environ.get("PI_BRIDGE_HOME")
     if home:
         return Path(home).expanduser().absolute()
@@ -567,17 +587,320 @@ def _webui_lease_pid(ui_session_id):
 
 _BACKEND_MARKERS = ("api.background_process", "tui_gateway.server")
 
+# ---------------------------------------------------------------------------
+# process-role host gate (v0.4.2, incident pb-20261019T082242Z-8d9299)
+# ---------------------------------------------------------------------------
+# The v0.4.1 gate vetoed every process with "gateway.run" in sys.modules.
+# But the REAL WebUI backend (hermes-webui server.py -- the legitimate
+# native host) lazily imports gateway.run in-process (agent/relay_runtime.py
+# via context compression) AFTER it has already hosted completions, which
+# permanently poisoned its poller.  The decision therefore starts from
+# PERSISTENT process identity -- argv, environment and the __main__ file --
+# which a lazy import cannot forge; loaded modules are only consulted for
+# processes whose persistent identity is unknown.  Parity with
+# pi_bridge/webui_event.host_decision is pinned by
+# tests/test_webui_event_parity.py.
+_WEBUI_IDENTITY_ENV = ("HERMES_WEBUI_STATE_DIR", "HERMES_WEBUI_AGENT_DIR")
+
+
+def _norm_path(p) -> str:
+    return str(p or "").replace("\\", "/")
+
+
+def _path_ends(p, suffix) -> bool:
+    """True when the normalized path ends with `suffix` on a path-element
+    boundary ('x/gateway/run.py' yes, 'x/mygateway/run.py' no)."""
+    p = _norm_path(p)
+    return p == suffix or p.endswith("/" + suffix)
+
+
+def _argv_module(argv, name) -> bool:
+    """True when argv runs module `name` (`python -m name ...`)."""
+    argv = list(argv or [])
+    for i in range(len(argv) - 1):
+        if argv[i] == "-m" and argv[i + 1] == name:
+            return True
+    return False
+
+
+def _main_file_default() -> str:
+    import sys
+    mf = getattr(sys.modules.get("__main__"), "__file__", None) \
+        or (sys.argv[0] if sys.argv else "")
+    return str(mf or "")
+
+
+def _webui_process_role(argv=None, environ=None, main_file=None):
+    """'gateway' | 'webui' | 'tui_backend' | 'unknown' from PERSISTENT
+    process identity only (argv, environment, the __main__ file -- all
+    injectable for tests).  Gateway signals are checked FIRST so a gateway
+    runner is vetoed even before it lazily imports gateway.run; webui
+    markers (HERMES_WEBUI_* env, hermes-webui/server.py|bootstrap.py) come
+    next, then the tui/desktop runner."""
+    import sys
+    if argv is None:
+        argv = sys.argv
+    if environ is None:
+        environ = os.environ
+    if main_file is None:
+        main_file = _main_file_default()
+    argv = [str(a) for a in (argv or [])]
+    mf = _norm_path(main_file)
+    is_hermes_cli = _argv_module(argv, "hermes_cli.main") \
+        or (argv and os.path.basename(argv[0]) == "hermes")
+    if (is_hermes_cli and "gateway" in argv[1:]) \
+            or "gateway.run" in argv or _path_ends(mf, "gateway/run.py"):
+        return "gateway"
+    if any(str(environ.get(k) or "").strip() for k in _WEBUI_IDENTITY_ENV) \
+            or _path_ends(mf, "hermes-webui/server.py") \
+            or _path_ends(mf, "hermes-webui/bootstrap.py"):
+        return "webui"
+    if _argv_module(argv, "tui_gateway") \
+            or _argv_module(argv, "tui_gateway.entry") \
+            or _path_ends(mf, "tui_gateway/entry.py"):
+        return "tui_backend"
+    return "unknown"
+
+
+def _webui_record_gate(ok, reason):
+    """Remember the latest gate outcome for the health record; a reason
+    TRANSITION logs exactly one line (never one per tick)."""
+    global _gate_reason_seen
+    if _health is not None:
+        _health["may_host"] = bool(ok)
+        _health["last_gate_reason"] = reason
+        if reason != _gate_reason_seen:
+            _gate_reason_seen = reason
+            _logger().info(f"gate pid={os.getpid()} host={bool(ok)} "
+                           f"reason={reason}")
+    return bool(ok), reason
+
+
+def _webui_host_decision(ui_session_id, *, argv=None, environ=None,
+                         main_file=None):
+    """(may_inject, reason) for THIS process:
+    1. an argv/env-identified gateway runner NEVER injects (its delegation
+       watcher terminally DROPS completions whose parent it cannot resolve)
+       regardless of which modules it happens to have loaded -- and
+       regardless of a live session lease;
+    2. a positive webui identity (webui role OR api.background_process, a
+       hermes-webui-exclusive module) always hosts -- this MUST win over a
+       LATE incidental import of gateway.run (the production regression);
+    3. the tui/desktop backend role hosts;
+    4. unknown role: a loaded gateway.run still vetoes (v0.4.1 behaviour),
+       then the legacy backend markers allow hosting;
+    5. finally the durable lease fallback: this process owns the session."""
+    import sys
+    role = _webui_process_role(argv=argv, environ=environ, main_file=main_file)
+    if role == "gateway":
+        return _webui_record_gate(False, "gateway-runner")
+    if role == "webui" or "api.background_process" in sys.modules:
+        return _webui_record_gate(True, "webui-positive")
+    if role == "tui_backend":
+        return _webui_record_gate(True, "tui-backend")
+    if "gateway.run" in sys.modules:
+        return _webui_record_gate(False, "gateway-run-loaded")
+    if any(m in sys.modules for m in _BACKEND_MARKERS):
+        return _webui_record_gate(True, "backend-marker")
+    if _webui_lease_pid(ui_session_id) == os.getpid():
+        return _webui_record_gate(True, "lease-self")
+    return _webui_record_gate(False, "no-host")
+
 
 def _webui_may_host(ui_session_id):
+    return _webui_host_decision(ui_session_id)[0]
+
+
+# ---------------------------------------------------------------------------
+# poller observability (v0.4.2): durable health record + rate-limited logs
+# ---------------------------------------------------------------------------
+# One JSON file per poller process at $PI_BRIDGE_HOME/health/poller-<pid>.json
+# (dir 0700, file 0600, atomic tmp+rename), read back by `pi-bridge health`
+# (pi_bridge/health.py).  Contents are pure bookkeeping: NEVER task text,
+# result text, ui_session_id or secrets.  Written on startup, when anything
+# meaningful changes and at least every _HEALTH_HEARTBEAT_S -- never on every
+# 3 s tick.  Logs go to logging.getLogger("pi_worker"): one start line, one
+# line per gate-reason transition, one line per claim/inject/delivered/
+# abandoned event (rare by nature) and unexpected exceptions rate-limited to
+# one line per identical message per _LOG_RETRY_S.  Idle ticks log nothing.
+_HEALTH_HEARTBEAT_S = 60.0
+_LOG_RETRY_S = 300.0
+# fields that change on every tick and are therefore NOT a "meaningful
+# change" for the write policy (otherwise the 3 s tick would rewrite the
+# record forever):
+_HEALTH_TS_FIELDS = ("last_tick_at", "last_scan_at")
+# ticks/scans always; gate_rejected/pending_refused_count keep growing while
+# some OTHER process holds a pending request this process must not host (the
+# incident's steady state!) -- they are observability, not change signals.
+_HEALTH_FREE_COUNTERS = ("ticks", "scans", "gate_rejected")
+_HEALTH_TMP_STALE_S = 3600.0
+
+_health = None               # live record dict (None until the first tick)
+_health_written_norm = None  # normalized JSON of the record last on disk
+_health_last_write_ts = 0.0
+_health_write_count = 0      # real file writes so far (tests/diagnostics)
+_gate_reason_seen = None
+_log_seen = {}               # message -> last logged epoch (rate limit)
+
+
+def _logger():
+    import logging
+    return logging.getLogger("pi_worker")
+
+
+def _health_now() -> float:
+    import time
+    return time.time()
+
+
+def _health_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _log_limited(msg):
+    """One WARNING line per identical message per _LOG_RETRY_S."""
+    import logging
+    now = _health_now()
+    last = _log_seen.get(msg)
+    if last is not None and now - last < _LOG_RETRY_S:
+        return
+    _log_seen[msg] = now
+    _logger().log(logging.WARNING, msg)
+
+
+def _health_new(pid):
+    return {
+        "pid": pid,
+        "plugin_version": _PLUGIN_VERSION,
+        "protocol": _WEBUI_PROTOCOL,
+        "role": "unknown",
+        "may_host": False,
+        "signals": {"gateway_run_loaded": False,
+                    "api_background_process_loaded": False,
+                    "tui_gateway_server_loaded": False},
+        "started_at": _health_iso(),
+        "last_tick_at": "",
+        "last_scan_at": "",
+        "last_pending_count": 0,
+        "last_gate_reason": "",
+        "pending_refused_count": 0,
+        "last": {"injected_job": None, "delivered_job": None,
+                 "abandoned_job": None, "error": None},
+        "counters": {"ticks": 0, "scans": 0, "injected": 0, "delivered": 0,
+                     "abandoned": 0, "gate_rejected": 0},
+    }
+
+
+def _health_first_tick(pid):
+    """Lazy init: a health record exists from the first tick even when the
+    thread was never started (tests drive _webui_poll_once directly)."""
+    global _health
+    _health = _health_new(pid)
+    _health["counters"]["ticks"] = 1
+    _health["role"] = _webui_process_role()
+    _webui_host_decision("")      # seed the gate state (no session yet)
+    _health["last_tick_at"] = _health_iso()
+    _logger().info(f"poller started pid={pid} role={_health['role']}")
+    _health_write(force=True)
+    return _health
+
+
+def _health_scan(reqs):
     import sys
-    # the gateway messaging runner imports tui_gateway.server too (its
-    # hosted-room worker) and its delegation watcher terminally DROPS
-    # completions whose parent session it cannot resolve: never inject there
-    if "gateway.run" in sys.modules:
-        return False
-    if any(m in sys.modules for m in _BACKEND_MARKERS):
-        return True
-    return _webui_lease_pid(ui_session_id) == os.getpid()
+    _health["counters"]["scans"] += 1
+    _health["last_scan_at"] = _health_iso()
+    _health["last_pending_count"] = sum(
+        1 for r in reqs if r.get("state") in ("pending", "inflight"))
+    sig = _health["signals"]
+    sig["gateway_run_loaded"] = "gateway.run" in sys.modules
+    sig["api_background_process_loaded"] = "api.background_process" \
+        in sys.modules
+    sig["tui_gateway_server_loaded"] = "tui_gateway.server" in sys.modules
+
+
+def _health_gate_refused(state_value):
+    if _health is None:
+        return
+    _health["counters"]["gate_rejected"] += 1
+    if state_value in ("pending", "inflight"):
+        _health["pending_refused_count"] += 1
+
+
+def _health_event(kind, job_id, reason=None):
+    """counters/last + one INFO line per delivery-lifecycle event (these are
+    rare by nature -- claims log separately in the tick)."""
+    if _health is None:
+        return
+    c = _health["counters"]
+    if kind == "injected":
+        _health["last"]["injected_job"] = str(job_id)
+        c["injected"] += 1
+    elif kind == "delivered":
+        _health["last"]["delivered_job"] = str(job_id)
+        c["delivered"] += 1
+    elif kind == "abandoned":
+        _health["last"]["abandoned_job"] = str(job_id)
+        c["abandoned"] += 1
+    _logger().info(f"{kind} job={job_id}"
+                   + (f" reason={reason}" if reason else ""))
+
+
+def _health_error(exc):
+    if _health is None:
+        return
+    _health["last"]["error"] = {"type": type(exc).__name__,
+                                "at": _health_iso()}
+
+
+def _health_write(force=False):
+    """Atomic 0600 health record; only on startup, meaningful change
+    (counters other than ticks/scans, gate, pending count, last_*) or the
+    60 s heartbeat -- never on every 3 s tick."""
+    global _health_written_norm, _health_last_write_ts, _health_write_count
+    import json as _json
+    from pathlib import Path  # noqa: F401  (style parity with the spool code)
+    if _health is None:
+        return
+    body = {k: v for k, v in _health.items() if k not in _HEALTH_TS_FIELDS}
+    body.pop("pending_refused_count", None)
+    body["counters"] = {k: v for k, v in (_health["counters"].items())
+                        if k not in _HEALTH_FREE_COUNTERS}
+    last = dict(_health.get("last") or {})
+    if isinstance(last.get("error"), dict):
+        # the error TYPE is a meaningful change; its timestamp is not (a
+        # repeatedly failing injection would otherwise rewrite every tick)
+        last["error"] = {"type": last["error"].get("type")}
+    body["last"] = last
+    norm = _json.dumps(body, ensure_ascii=False, sort_keys=True)
+    now = _health_now()
+    if not force and norm == _health_written_norm \
+            and now - _health_last_write_ts < _HEALTH_HEARTBEAT_S:
+        return
+    try:
+        d = _bridge_home() / "health"
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(d, 0o700)
+        raw = _json.dumps(_health, ensure_ascii=False, sort_keys=True)
+        final = d / f"poller-{_health['pid']}.json"
+        tmp = d / f".poller-{_health['pid']}.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(raw)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, final)
+        _health_written_norm = norm
+        _health_last_write_ts = now
+        _health_write_count += 1
+        # a crashed writer leaves .poller-*.json.tmp behind; reap old ones
+        # opportunistically (bounded dir, cheap glob).
+        for p in d.glob(".poller-*.json.tmp"):
+            try:
+                if now - p.stat().st_mtime > _HEALTH_TMP_STALE_S:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass  # observability must never break the poller
 
 
 def _webui_ack_job(hermes, req, ok, reason):
@@ -616,79 +939,122 @@ def _webui_ack_job(hermes, req, ok, reason):
 
 
 def _webui_poll_once():
-    hermes = _webui_hermes()
-    for req in _webui_scan():
-        try:
-            if not _webui_may_host(req.get("ui_session_id") or ""):
-                continue
-            if hermes is None:
-                # inside a Hermes process whose internals are not importable
-                # (odd install, partially initialized): visible, retried.
-                claimed = _webui_claim(req)
-                if claimed is not None:
-                    _webui_release(claimed, "unsupported",
-                                   reason="hermes-internal-unavailable")
-                continue
-            claimed = _webui_claim(req)
-            if claimed is None:
-                continue
+    if _health is None:
+        _health_first_tick(os.getpid())
+    else:
+        _health["counters"]["ticks"] += 1
+        _health["last_tick_at"] = _health_iso()
+    try:
+        hermes = _webui_hermes()
+        reqs = _webui_scan()
+        _health_scan(reqs)
+        for req in reqs:
             try:
-                st = claimed.get("state")
-                if st in ("pending", "inflight"):
-                    if int(claimed.get("attempts") or 0) >= \
+                if not _webui_may_host(req.get("ui_session_id") or ""):
+                    _health_gate_refused(req.get("state"))
+                    continue
+                if hermes is None:
+                    # inside a Hermes process whose internals are not
+                    # importable (odd install, partially initialized):
+                    # visible, retried.
+                    claimed = _webui_claim(req)
+                    if claimed is not None:
+                        _logger().info(f"claim job={claimed.get('job_id')}")
+                        _webui_release(claimed, "unsupported",
+                                       reason="hermes-internal-unavailable")
+                    continue
+                claimed = _webui_claim(req)
+                if claimed is None:
+                    continue
+                _logger().info(f"claim job={claimed.get('job_id')}")
+                try:
+                    st = claimed.get("state")
+                    jid = claimed.get("job_id")
+                    if st in ("pending", "inflight"):
+                        if int(claimed.get("attempts") or 0) >= \
+                                _WEBUI_MAX_ATTEMPTS:
+                            _webui_release(
+                                claimed, "abandoned",
+                                reason="injection-attempts-exhausted")
+                            _webui_ack_job(hermes, claimed, False,
+                                           "injection-attempts-exhausted")
+                            _health_event("abandoned", jid,
+                                          "injection-attempts-exhausted")
+                            continue
+                        injected = dict(
+                            claimed,
+                            attempts=int(claimed.get("attempts") or 0) + 1)
+                        _webui_inject(hermes, injected)
+                        _webui_release(injected, "injected")
+                        _health_event("injected", jid)
+                        continue
+                    # st == "injected": read the durable ledger ack.
+                    row = _webui_ledger_state(
+                        hermes, _webui_delegation_id(claimed))
+                    if row is None:  # ledger row vanished -> re-inject
+                        claimed = dict(
+                            claimed,
+                            attempts=int(claimed.get("attempts") or 0) + 1)
+                        _webui_inject(hermes, claimed)
+                        _webui_release(claimed, "injected")
+                        _health_event("injected", jid)
+                        continue
+                    delivery, claimed_now = row
+                    if delivery == "delivered":
+                        _webui_release(claimed, "delivered", reason="ok")
+                        _webui_ack_job(hermes, claimed, True, "ok")
+                        _health_event("delivered", jid)
+                    elif delivery == "dropped":
+                        _webui_release(claimed, "abandoned",
+                                       reason="native-delivery-exhausted")
+                        _webui_ack_job(hermes, claimed, False,
+                                       "native-delivery-exhausted")
+                        _health_event("abandoned", jid,
+                                      "native-delivery-exhausted")
+                    elif claimed_now:
+                        # another consumer holds a live claim: put the
+                        # request back where the next tick's scan can find
+                        # it, or the ack would never be observed.
+                        _webui_release(claimed, "injected")
+                    elif int(claimed.get("attempts") or 0) >= \
                             _WEBUI_MAX_ATTEMPTS:
-                        _webui_release(
-                            claimed, "abandoned",
-                            reason="injection-attempts-exhausted")
+                        _webui_release(claimed, "abandoned",
+                                       reason="injection-attempts-exhausted")
                         _webui_ack_job(hermes, claimed, False,
                                        "injection-attempts-exhausted")
-                        continue
-                    injected = dict(claimed,
-                                    attempts=int(claimed.get("attempts")
-                                                 or 0) + 1)
-                    _webui_inject(hermes, injected)
-                    _webui_release(injected, "injected")
-                    continue
-                # st == "injected": read the durable ledger ack.
-                row = _webui_ledger_state(hermes,
-                                          _webui_delegation_id(claimed))
-                if row is None:  # ledger row vanished -> re-inject
-                    _webui_inject(hermes, claimed)
-                    _webui_release(claimed, "injected")
-                    continue
-                delivery, claimed_now = row
-                if delivery == "delivered":
-                    _webui_release(claimed, "delivered", reason="ok")
-                    _webui_ack_job(hermes, claimed, True, "ok")
-                elif delivery == "dropped":
-                    _webui_release(claimed, "abandoned",
-                                   reason="native-delivery-exhausted")
-                    _webui_ack_job(hermes, claimed, False,
-                                   "native-delivery-exhausted")
-                elif claimed_now:
-                    # another consumer holds a live claim: put the request
-                    # back where the next tick's scan can find it, or the
-                    # ack would never be observed.
-                    _webui_release(claimed, "injected")
-                elif int(claimed.get("attempts") or 0) >= _WEBUI_MAX_ATTEMPTS:
-                    _webui_release(claimed, "abandoned",
-                                   reason="injection-attempts-exhausted")
-                    _webui_ack_job(hermes, claimed, False,
-                                   "injection-attempts-exhausted")
-                else:  # pending, unclaimed -> safe to re-queue the event
-                    claimed = dict(claimed,
-                                   attempts=int(
-                                       claimed.get("attempts") or 0) + 1)
-                    _webui_inject(hermes, claimed)
-                    _webui_release(claimed, "injected")
+                        _health_event("abandoned", jid,
+                                      "injection-attempts-exhausted")
+                    else:  # pending, unclaimed -> safe to re-queue the event
+                        claimed = dict(
+                            claimed,
+                            attempts=int(claimed.get("attempts") or 0) + 1)
+                        _webui_inject(hermes, claimed)
+                        _webui_release(claimed, "injected")
+                        _health_event("injected", jid)
+                except Exception as exc:
+                    # EVERY real injection attempt burns the durable attempt
+                    # budget -- also the ones that raise, or a permanently
+                    # failing injection would retry forever (v0.4.2 fix).
+                    retry = dict(claimed,
+                                 attempts=int(claimed.get("attempts") or 0)
+                                 + 1)
+                    try:
+                        _webui_release(retry, "pending",
+                                       reason=f"{type(exc).__name__}")
+                    except Exception:
+                        pass
+                    _health_error(exc)
+                    _log_limited(f"inject failed job={jid}: "
+                                 f"{type(exc).__name__}")
             except Exception as exc:
-                try:
-                    _webui_release(claimed, "pending",
-                                   reason=f"{type(exc).__name__}")
-                except Exception:
-                    pass
-        except Exception:
-            pass  # the poller thread must never die
+                _health_error(exc)
+                _log_limited(f"poll item failed: {type(exc).__name__}")
+                # the poller thread must never die
+    except Exception as exc:
+        _health_error(exc)
+        _log_limited(f"poll tick failed: {type(exc).__name__}")
+    finally:
+        _health_write()
 
 
 def _webui_poller_loop(stop_event):
@@ -701,9 +1067,15 @@ def _webui_poller_loop(stop_event):
 
 def _start_webui_poller():
     import threading
-    global _webui_poller_state
+    global _webui_poller_state, _home_pin
     if _webui_poller_state is not None:
         return
+    # The thread outlives any caller's environment (in tests the fixture env
+    # is torn down while this daemon thread keeps ticking).  Pin the bridge
+    # home NOW so every later tick -- scans AND health writes -- stays in
+    # the tree the process was started against.  Production env is stable,
+    # so the pin is identical to the env lookup there.
+    _home_pin = _bridge_home()
     stop = threading.Event()
     t = threading.Thread(target=_webui_poller_loop, args=(stop,),
                          name="pi-worker-webui-poller", daemon=True)

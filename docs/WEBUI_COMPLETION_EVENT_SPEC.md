@@ -51,20 +51,15 @@ Both branches are wrong. A user-like `chat -q` turn is not a transport.
 3. The bridge Hermes plugin (`plugin/__init__.py`) gains an in-process
    completion poller (daemon thread, started once per process from
    `register(ctx)`, every ~3 s, every exception caught):
-   * injects ONLY in a process that can natively host the session: the
-     Hermes WebUI server (`api.background_process` loaded — the production
-     consumer, its drain thread starts the wakeup turn SERVER-SIDE at the
-     idle boundary and leaves a server-side marker for the next-turn drain
-     while busy — or a tui/desktop backend, `tui_gateway.server` loaded, via
-     its per-session notification poller) — but NEVER the gateway messaging
-     runner (`gateway.run` loaded, checked first: it imports
-     tui_gateway.server itself for its hosted-room worker, and its
-     delegation watcher preflights foreign completions against the session
-     DB and terminally DROPS them) — or a process that provably holds the
-     session's own lease (`active_sessions.json`, `$HERMES_HOME` honored,
-     entry with `session_id == ui_session_id` and `pid == os.getpid()`). A
-     gateway process never injects → zero new behavior there; the request
-     simply waits in the spool for the process that hosts the session.
+   * injects ONLY in a process that can natively host the session, decided
+     by the v0.4.2 process-role gate below — never by "was `gateway.run`
+     ever imported" (that lazy-import check was the v0.4.1 poisoning bug);
+     a process that provably holds the session's own lease
+     (`active_sessions.json`, `$HERMES_HOME` honored, entry with
+     `session_id == ui_session_id` and `pid == os.getpid()`) may also
+     inject.  A gateway-runner process never injects → zero new behavior
+     there; the request simply waits in the spool for the process that
+     hosts the session.
    * injection = Hermes' OWN native background-completion pipeline:
      a durable ledger row in `async_delegations` (`INSERT OR IGNORE`,
      `state='completed'`, `delivery_state='pending'`, owner fields NULL) via
@@ -90,6 +85,67 @@ If neither gate is ever true (browser never opened), the request stays
 pending forever, harmlessly: nothing is lost (job state + pi_status), the
 wake webhook still fires for the operator-side acceptance run, and the
 acceptance prompt itself is idempotent (pi_status first).
+
+## Process-role gate (v0.4.2) — why "was gateway.run imported" was wrong
+
+Root cause (incident pb-20261019T082242Z-8d9299): the WebUI backend hosts
+the agent in-process, and agent code lazy-imports `gateway.run` (e.g.
+`agent/relay_runtime.py` reading the gateway config during durable
+compression).  From that moment `"gateway.run" in sys.modules` is true in
+the REAL WebUI backend, so v0.4.1's veto turned the one legitimate host into
+a permanent non-host: pending spool requests were scanned but never
+injected, silently, forever.
+
+The gate now decides by PROCESS ROLE, detected from persistent startup
+signals (argv, environment, `__main__` script path) — never from lazy
+imports — via `plugin._webui_process_role()` / `webui_event.process_role()`
+(twin implementations pinned by `tests/test_webui_event_parity.py`):
+
+* `gateway` — argv `-m hermes_cli.main gateway <run…>`, the `hermes gateway
+  …` console script, argv `-m gateway.run`, or main script
+  `…/gateway/run.py`.  NEVER injects (argv-based veto, holds even before
+  `gateway.run` is imported and even while it self-holds a session lease:
+  the gateway's delegation watcher terminally DROPS foreign completions).
+* `webui` — env `HERMES_WEBUI_STATE_DIR`/`HERMES_WEBUI_AGENT_DIR` (set by
+  the WebUI server only) or main script `…/hermes-webui/server.py|bootstrap.py`.
+  Positive webui identity — role `webui`, or `api.background_process` in
+  `sys.modules` (a hermes-webui-only module a gateway can never import) —
+  WINS over a late incidental `gateway.run` import.
+* `tui_backend` — `-m tui_gateway[.entry]` or main `…/tui_gateway/entry.py`;
+  injects via its per-session notification poller.
+* `unknown` (plain CLI, tests) — conservative fallback: `gateway.run`
+  loaded → refuse; a backend marker loaded → allow; then the lease fallback
+  (pid of the session's lease entry == own pid).
+
+`tui_gateway.server` alone is NOT sufficient (the gateway imports it for
+its hosted-room worker); the role/argv veto is evaluated first.
+
+## Durable retry counter and budget (v0.4.2)
+
+Every real injection attempt — including one that RAISES — increments the
+on-disk `attempts` before the request returns to `pending` (v0.4.1 released
+the ORIGINAL attempts on exception, so a permanently failing injector spun
+forever and the exhaustion branch was unreachable).  The cap is 1200 (~1 h
+at the 3 s tick), overridable with `PI_BRIDGE_MAX_INJECTION_ATTEMPTS` in
+both twins; exhaustion transitions the request to `abandoned`
+(`reason="injection-attempts-exhausted"`) and acks the job's delivery
+`ok=false`.  Attempts live in the spool file, so restarts never reset them.
+
+## Poller observability (v0.4.2)
+
+Every poller process keeps `$PI_BRIDGE_HOME/health/poller-<pid>.json` (dir
+0700, file 0600, atomic) current: pid, detected `role`, `may_host`, loaded
+module booleans (`signals`), `started_at`/`last_tick_at`/`last_scan_at`,
+`last_pending_count`, `last_gate_reason`, `pending_refused_count`, the last
+injected/delivered/abandoned job ids, the last error TYPE, and counters.
+It never contains task text, result text, ui_session_id or secrets.  The
+file is written on startup, on meaningful change and on a 60 s heartbeat —
+monotonic tick/scan/refusal counters and error timestamps are deliberately
+NOT change signals (no 3 s rewrite).  Read it back with
+`pi-bridge health [--json]` (read-only).  Logs go to the `pi_worker`
+logger: one start line, one line per gate-reason transition, one line per
+claim/inject/delivered/abandoned event, unexpected exceptions rate-limited;
+idle ticks log nothing.
 
 ## Truncation (symptom B) — boundary and guard
 
@@ -124,6 +180,14 @@ doomed job.
   idempotent per (job, turn); two jobs of one session = two independent
   requests/events with distinct delegation_ids; backend restart replay =
   pending request survives scan; ack transitions (delivered/dropped/
-  unsupported); gate function: gateway process (no tui_gateway.server, lease
-  held by another pid) injects nothing.
+  unsupported); the v0.4.2 gate: clean webui host injects, the SAME host
+  still injects after a late `gateway.run` import (the incident
+  regression), a gateway-argv process NEVER injects (all real argv shapes,
+  even pre-import and even self-leased), `tui_gateway.server` alone grants
+  nothing to a gateway, lease fallback intact; transient inject failure
+  burns `attempts` durably and retry delivers, repeated failures exhaust
+  the (env-overridable) budget into `abandoned`, attempts survive a plugin
+  restart, a stuck pending spool is injected by a fresh plugin module;
+  health record contents (no task/result/session-id leak), write rate
+  limits, reader and CLI (`tests/test_health.py`).
 * Telegram-origin delivery tests from v0.4.0 must stay green unchanged.

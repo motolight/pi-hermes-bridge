@@ -2,6 +2,9 @@
  *
  * Answers one question on the chat row that started a pi_delegate task (the
  * job's origin UI session): "is Pi working for me right now, and on what?"
+ * A job whose origin is unknown (origin null in job.json) is bound to no one
+ * chat: the writer files it under session "*" and its badge shows on every
+ * chat row — a running job is better seen from every window than not at all.
  *
  *   >= 1 running job  -> a blinking "Pi: N" pill; the click lists EVERY
  *                        running job (id, duration, turn, PI WEB link), with
@@ -9,6 +12,11 @@
  *   no running job    -> a static "Pi: N" pill counting the finished/failed
  *                        jobs of the last day that are still unacknowledged.
  *                        N == 0  -> no badge at all.
+ *   finished, but Hermes has not received the completion yet (writer >= 1.3
+ *                        `hermes.state == "awaiting"`) -> the same counter in
+ *                        AMBER: "Pi done · waiting for Hermes", because green
+ *                        would be a lie.  A delivery Hermes gave up on is a
+ *                        problem (red, Acknowledge-only), never a success.
  *
  * Finished (done/cancelled) jobs stop taking card space DONE_QUIET_S after
  * they end — they stay in the number, not in the list.  A failure is never
@@ -59,6 +67,44 @@
     running: 'Pi works…', stalled: 'Pi silent (stalled?)', done: 'Pi done',
     failed: 'Pi failed', cancelled: 'Pi cancelled', interrupted: 'Pi interrupted',
   };
+
+  /* Delivery honesty (writer >= 1.3): a terminal job may carry
+   * `hermes` = {state, reason, kind} describing whether HERMES received the
+   * completion.  "awaiting" = Pi finished, the completion event is queued and
+   * the in-browser Hermes backend has not taken it yet (amber, not green);
+   * "delivered" = it truly arrived; "failed" = Hermes gave up (a problem:
+   * red, never time-quieted, Acknowledge-only).  A missing/unknown `hermes`
+   * (writer < 1.3, a synchronous `send`/telegram delivery, an old job.json)
+   * means the Hermes side is unknowable and everything below must behave
+   * exactly as it did before — feature-checked, never assumed. */
+  const HERMES_STATES = { delivered: 1, awaiting: 1, failed: 1 };
+  function hermesState(j) {
+    const h = j && j.hermes;
+    if (!h || typeof h !== 'object') return null;
+    // own-property lookup only: a state of "toString" must not read as known
+    return Object.prototype.hasOwnProperty.call(HERMES_STATES, h.state) ? h.state : null;
+  }
+  // Only a job Pi itself considers finished can be delivery-pending or
+  // delivery-failed: a failed/interrupted/cancelled job stays exactly the
+  // red problem row it always was, with the delivery state as extra detail.
+  const isAwaiting = (j) => j.view === 'done' && hermesState(j) === 'awaiting';
+  const isDelivFail = (j) => j.view === 'done' && hermesState(j) === 'failed';
+  function hermesReason(j, fallback) {
+    const h = (j && j.hermes) || {};
+    const r = h.reason != null ? h.reason : (j.delivery && j.delivery.reason);
+    return (typeof r === 'string' && r) ? r : (fallback || 'unknown');
+  }
+  // The card line that says, in words, whether Hermes got the result.
+  function hermesLine(j) {
+    const st = hermesState(j);
+    if (!st) return null;
+    if (st === 'delivered') return 'Hermes received the completion';
+    if (st === 'awaiting') {
+      return 'Hermes has not picked the completion up yet ('
+        + hermesReason(j, 'queued') + ')';
+    }
+    return 'Hermes did NOT receive the completion (' + hermesReason(j) + ')';
+  }
 
   /* Freshness of the snapshot.
    *
@@ -216,17 +262,24 @@
   /* active | recent | quiet | aged — writer's answer if present, else ours. */
   function groupOf(j) {
     if (ACTIVE_VIEWS[j.view]) return 'active';
-    if (typeof j.group === 'string' && GROUPS[j.group]) return j.group;
+    const hs = hermesState(j);
+    // A completion that is still waiting for Hermes, or that Hermes will
+    // never get, is actionable: time must not hide it, whatever the group.
+    const actionable = hs === 'awaiting' || hs === 'failed';
+    if (typeof j.group === 'string' && GROUPS[j.group]) {
+      if (j.group === 'quiet' && actionable) return 'recent';
+      return j.group;
+    }
     const age = terminalAgeS(j);
     if (age == null) return 'recent';            // unknown age: show, don't hide
     if (age > state.windowS) return 'aged';
-    if (QUIET_VIEWS[j.view] && age > state.quietS) return 'quiet';
+    if (QUIET_VIEWS[j.view] && age > state.quietS && !actionable) return 'quiet';
     return 'recent';
   }
 
   /* ── polling ─────────────────────────────────────────────────────────── */
   function emptyBucket() {
-    return { active: [], problem: [], done: [], quiet: [], count: 0, tone: 'idle', sig: '' };
+    return { active: [], problem: [], done: [], quiet: [], awaiting: 0, count: 0, tone: 'idle', sig: '' };
   }
 
   function bucketize(data) {
@@ -241,6 +294,7 @@
         let b = bySession.get(sid);
         if (!b) { b = emptyBucket(); bySession.set(sid, b); }
         if (g === 'active') b.active.push(j);
+        else if (isDelivFail(j)) b.problem.push(j);   // never received = a failure
         else if (QUIET_VIEWS[j.view]) (g === 'quiet' ? b.quiet : b.done).push(j);
         else b.problem.push(j);
         seen.add(j.job_id);
@@ -263,7 +317,10 @@
     const n = b.active.length || terminal;
     b.count = n;
     b.terminal = terminal;
-    b.tone = b.active.length ? 'live' : (b.problem.length ? 'alert' : 'idle');
+    // Amber, but only when nothing is actually running and nothing is broken:
+    // "Pi is finished, Hermes has not received it yet" is a wait, not an alarm.
+    b.awaiting = b.done.filter(isAwaiting).length;
+    b.tone = b.active.length ? 'live' : (b.problem.length ? 'alert' : (b.awaiting ? 'awaiting' : 'idle'));
     b.problems = b.problem.length;
     // A card is rebuilt from live state on every click, so the DOM only needs
     // to know when what the user SEES changes: the number, the colour, and a
@@ -338,6 +395,10 @@
     if (live && ref.info.problems) {
       msg += ' · ' + ref.info.problems + ' unacknowledged failure(s) behind them';
     }
+    if (!live && ref.info.awaiting) {
+      msg += ' · ' + ref.info.awaiting
+        + ' finished but not yet received by Hermes';
+    }
     b.title = msg;
     b.setAttribute('aria-label', msg);
     const open = (ev) => { ev.preventDefault(); ev.stopPropagation(); openCard({ sid: ref.sid, anchor: b }); };
@@ -362,8 +423,15 @@
     container.appendChild(badgeFor(ref));
   }
 
-  // Bucket for a session, resolved *at render/click time*.
-  function bucketFor(sid) { return sid ? (state.bySession.get(sid) || null) : null; }
+  // Bucket for a session, resolved *at render/click time*.  A job whose
+  // origin the writer could not attribute lives in the wildcard bucket "*"
+  // (writer >= 1.2): it belongs to no chat, so every chat that has no bucket
+  // of its own falls back to it — the lamp is visible from every window.
+  // The job is stored under the single key "*", so it is never counted twice.
+  function bucketFor(sid) {
+    const own = sid ? state.bySession.get(sid) : null;
+    return own || state.bySession.get('*') || null;
+  }
 
   // Muted, non-interactive dot shown when the snapshot has gone stale.
   function staleBadgeEl() {
@@ -561,11 +629,16 @@
   }
 
   function terminalItem(s, j, kind, ref) {
-    const it = itemBox('pilamp-item--' + j.view);
+    const delivFail = isDelivFail(j);
+    // A completion Hermes never got is a problem row, not a finished row, so
+    // it loses the green `--done` class and gets its own red one.
+    const it = itemBox(delivFail ? 'pilamp-item--deliveryfailed'
+      : 'pilamp-item--' + j.view + (isAwaiting(j) ? ' pilamp-item--awaiting' : ''));
     const l1 = el('pilamp-item-main');
     l1.appendChild(el('pilamp-item-id', j.job_id));
-    l1.appendChild(el(kind === 'problem' ? 'pilamp-warn' : 'pilamp-dim',
-      ' · ' + (VIEW_LABEL[j.view] || j.view)));
+    l1.appendChild(el((kind === 'problem' || delivFail) ? 'pilamp-warn' : 'pilamp-dim',
+      ' · ' + (isAwaiting(j) ? 'Pi done · waiting for Hermes'
+        : (VIEW_LABEL[j.view] || j.view))));
     l1.appendChild(ackButton(j, () => { dismiss([j]); refreshCard(ref); }));
     it.appendChild(l1);
     const age = (j.finished_age_s != null) ? fmtDur(j.finished_age_s) + ' ago'
@@ -577,7 +650,9 @@
     if (j.status) bits.push(j.status);
     if (j.result_chars) bits.push(j.result_chars + ' chars');
     it.appendChild(el('pilamp-item-sub', bits.join(' · ')));
-    if (j.delivery && !j.delivery.ok && j.delivery.attempted) {
+    const hline = hermesLine(j);          // writer >= 1.3, webui-event deliveries
+    if (hline) it.appendChild(el('pilamp-item-sub', hline));
+    else if (j.delivery && !j.delivery.ok && j.delivery.attempted) {
       it.appendChild(el('pilamp-item-sub', 'report NOT delivered ('
         + (j.delivery.reason || 'error') + ')'));
     }
@@ -602,10 +677,13 @@
 
     const head = document.createElement('div');
     head.className = 'pilamp-card-head';
-    const headCls = info.active.length ? 'live' : (info.problem.length ? 'alert' : 'idle');
+    const headCls = info.active.length ? 'live'
+      : (info.problem.length ? 'alert' : (info.awaiting ? 'awaiting' : 'idle'));
     const title = info.active.length
       ? 'Pi is working — ' + info.active.length
-      : (info.problem.length ? 'Needs attention — ' + info.count : 'Finished work — ' + info.count);
+      : (info.problem.length ? 'Needs attention — ' + info.count
+        : (info.awaiting ? 'Waiting for Hermes — ' + info.count
+          : 'Finished work — ' + info.count));
     const ttl = el('pilamp-card-title pilamp-text--' + headCls, title);
     head.appendChild(ttl);
     const x = document.createElement('button');
@@ -652,7 +730,24 @@
         + ' finished / failed ' + (all.length === 1 ? 'job' : 'jobs');
       btn.title = 'Optional: clears the badge now. Finished jobs also stop being listed on their own after '
         + fmtDur(state.quietS) + '.';
-      btn.onclick = () => { dismiss(all); refreshCard(ref); };
+      btn.onclick = () => {
+        // One click must clear the badge. When this acknowledge empties the
+        // chat's own bucket, bucketFor() would fall through to the wildcard
+        // and the badge would instantly re-appear from jobs this card never
+        // showed — so clear what the user WOULD see next too: the wildcard's
+        // terminal jobs. Its running jobs are never ack-ed (a live badge
+        // stays honest), and while this chat still has running work of its
+        // own the fallback is not what the user sees, so the wildcard is
+        // left untouched.
+        const extra = [];
+        const own = ref.sid ? state.bySession.get(ref.sid) : null;
+        const wild = state.bySession.get('*');
+        if (wild && wild !== own && own && own.active.length === 0) {
+          extra.push(...wild.problem, ...wild.done, ...wild.quiet);
+        }
+        dismiss(all.concat(extra));
+        refreshCard(ref);
+      };
       c.appendChild(btn);
     }
 

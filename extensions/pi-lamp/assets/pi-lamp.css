@@ -48,6 +48,15 @@
   color: #c6f0d8;
 }
 
+/* Nothing running, but a finished job's completion has not reached Hermes
+   yet (writer >= 1.3 delivery honesty): amber and steady — it is a wait, not
+   an alarm, and it is definitely not green. */
+.pilamp-badge.pilamp--awaiting {
+  background: rgba(245, 166, 35, 0.16);
+  border-color: #f5a623;
+  color: #ffe2ab;
+}
+
 /* Something IS running (the number counts those), but failures are waiting
    behind them: the number stays the answer, a red pip says it is not clean. */
 .pilamp-badge.pilamp--problems { position: relative; }
@@ -120,6 +129,7 @@
 .pilamp-text--live { color: #6fb0ff; }
 .pilamp-text--alert { color: #ff8e80; }
 .pilamp-text--idle { color: #67d99a; }
+.pilamp-text--awaiting { color: #f5c46b; }
 
 .pilamp-card-body {
   max-height: min(62vh, 440px);
@@ -168,6 +178,11 @@
 .pilamp-item--interrupted { border-left-color: #e74c3c; }
 .pilamp-item--done       { border-left-color: rgba(46, 204, 113, 0.7); }
 .pilamp-item--cancelled  { border-left-color: #8a8f98; }
+/* Delivery honesty (writer >= 1.3): amber = Pi finished, Hermes has not taken
+   the completion yet (a --done row, still counted as finished work);
+   red = Hermes gave up, and the row replaces --done (it is a problem). */
+.pilamp-item--awaiting       { border-left-color: #f5a623; }
+.pilamp-item--deliveryfailed { border-left-color: #e74c3c; }
 
 .pilamp-item-main {
   display: flex;

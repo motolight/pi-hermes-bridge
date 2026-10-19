@@ -91,6 +91,11 @@ def harness(tmp_path, monkeypatch):
     home = tmp_path / "bridge-home"
     (home / "jobs").mkdir(parents=True)
     monkeypatch.setenv("PI_BRIDGE_HOME", str(home))
+    # deterministic persistent-identity inputs: no webui role from the
+    # ambient environment, no attempt-cap override
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", raising=False)
     # the real ~/.hermes must never be consulted: an empty hermes home, no lease
     fake_home = tmp_path / "fake-home"
     (fake_home / ".hermes" / "runtime").mkdir(parents=True)
@@ -107,14 +112,16 @@ def harness(tmp_path, monkeypatch):
     def fake_transaction():
         yield FakeConn(ledger)
 
-    monkeypatch.setattr(mod, "_webui_hermes",
-                        lambda: (contextlib.nullcontext(), fake_transaction,
-                                 registry))
+    def fake_hermes():
+        return (contextlib.nullcontext(), fake_transaction, registry)
+
+    monkeypatch.setattr(mod, "_webui_hermes", fake_hermes)
     monkeypatch.setattr(mod, "_webui_may_host", lambda sid: True)
     return type("H", (), {"mod": mod, "home": home, "ledger": ledger,
                           "registry": registry, "tmp": tmp_path,
                           "hermes_home": fake_home / ".hermes",
                           "real_may_host": real_may_host,
+                          "fake_hermes": fake_hermes,
                           "monkeypatch": monkeypatch})
 
 
@@ -502,3 +509,303 @@ def test_hermes_home_env_lease_claims_host_for_this_pid(harness, monkeypatch):
     h.mod._webui_poll_once()
     assert on_disk(h)["state"] == "injected"
     assert len(drain(h.registry.completion_queue)) == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.4.2 process-role gate (incident pb-20261019T082242Z-8d9299)
+# ---------------------------------------------------------------------------
+
+PYTEST_ARGV = [str(Path(sys.executable)), "-m", "pytest", "tests"]
+
+
+def test_process_role_table(harness):
+    """Persistent identity only -- argv, environment, __main__ file."""
+    role = harness.mod._webui_process_role
+    gw = "gateway"
+    assert role([sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+                {}, "/venv/bin/python") == gw
+    assert role(["/h/venv/bin/hermes", "gateway", "run"],
+                {}, "/h/venv/bin/hermes") == gw
+    assert role([sys.executable, "-m", "gateway.run"], {}, "") == gw
+    assert role([sys.executable], {}, "/opt/hermes/gateway/run.py") == gw
+    # the gateway check comes FIRST: even webui-looking env cannot launder
+    # an argv-identified gateway runner
+    assert role([sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+                {"HERMES_WEBUI_STATE_DIR": "/s"}, "") == gw
+    webui = "webui"
+    assert role(PYTEST_ARGV, {"HERMES_WEBUI_STATE_DIR": "/s"},
+                "/venv/bin/pytest") == webui
+    assert role(PYTEST_ARGV, {"HERMES_WEBUI_AGENT_DIR": "/a"},
+                "/venv/bin/pytest") == webui
+    assert role([], {}, "/srv/hermes-webui/server.py") == webui
+    assert role([], {}, "/srv/hermes-webui/bootstrap.py") == webui
+    tui = "tui_backend"
+    assert role([sys.executable, "-m", "tui_gateway.entry"], {}, "") == tui
+    assert role([sys.executable, "-m", "tui_gateway"], {}, "") == tui
+    assert role([], {}, "/app/tui_gateway/entry.py") == tui
+    unknown = "unknown"
+    assert role(PYTEST_ARGV, {}, str(Path(sys.executable) /
+                                     "pytest")) == unknown
+    assert role(PYTEST_ARGV, {"HERMES_WEBUI_STATE_DIR": ""},
+                "/venv/bin/pytest") == unknown      # empty env does not count
+    # hermes_cli.main without a 'gateway' subcommand is not the runner
+    assert role([sys.executable, "-m", "hermes_cli.main", "chat"], {},
+                "") == unknown
+    # 'hermesx' is not the 'hermes' console script
+    assert role(["/h/bin/hermesx", "gateway", "run"], {}, "") == unknown
+
+
+def test_webui_host_survives_the_late_gateway_run_import(harness, monkeypatch):
+    """THE production regression, end to end: a clean webui host (webui env
+    markers, no webui-shaped argv) completes one delivery, then lazily
+    imports gateway.run (agent/relay_runtime.py via compression) -- the
+    second completion must STILL be injected, not poison the poller."""
+    h = harness
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv", list(PYTEST_ARGV))
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(h.tmp / "webui-state"))
+
+    make_job(h, JID_A, text="first outcome")
+    h.mod._webui_poll_once()
+    assert len(drain(h.registry.completion_queue)) == 1
+    assert on_disk(h, JID_A)["state"] == "injected"
+
+    # the exact poisoning event, AFTER the first completion:
+    monkeypatch.setitem(sys.modules, "gateway.run", type(sys)("gateway.run"))
+    assert h.mod._webui_host_decision(SID) == (True, "webui-positive")
+
+    make_job(h, JID_B, text="second outcome")
+    h.mod._webui_poll_once()
+    # JID_A's ledger row is still pending/unclaimed, so its event is
+    # re-queued too -- the point is that JID_B's NEW completion is there
+    # even though gateway.run is now loaded in this webui host.
+    assert {e["delegation_id"] for e in drain(h.registry.completion_queue)} \
+        == {f"pi-bridge-{JID_A}-t1", f"pi-bridge-{JID_B}-t1"}
+    assert on_disk(h, JID_B)["state"] == "injected"
+
+
+def test_webui_role_purely_from_env_beats_loaded_gateway_run(harness,
+                                                              monkeypatch):
+    h = harness
+    make_job(h)
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv", list(PYTEST_ARGV))   # argv says pytest
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", "/srv/webui-state")
+    monkeypatch.setitem(sys.modules, "gateway.run", type(sys)("gateway.run"))
+    monkeypatch.setitem(sys.modules, "tui_gateway.server",
+                        type(sys)("tui_gateway.server"))
+    assert h.mod._webui_may_host(SID) is True
+    h.mod._webui_poll_once()
+    assert len(drain(h.registry.completion_queue)) == 1
+    assert on_disk(h)["state"] == "injected"
+
+
+GATEWAY_ARGVS = [
+    ["/h/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"],
+    ["/h/venv/bin/hermes", "gateway", "run"],           # console script
+    ["/h/venv/bin/python", "-m", "gateway.run"],
+]
+
+
+@pytest.mark.parametrize("argv", GATEWAY_ARGVS)
+@pytest.mark.parametrize("mods", [
+    ("gateway.run", "tui_gateway.server"),   # fully-imported gateway
+    ("tui_gateway.server",),                 # BEFORE the lazy gateway.run
+])
+def test_gateway_runner_never_injects(harness, monkeypatch, argv, mods):
+    """A real gateway runner must stay out of injection regardless of which
+    modules it has loaded -- the argv-based veto holds even when
+    gateway.run is not yet imported (the mirror of the poisoning bug: the
+    watcher terminally DROPS completions whose parent it cannot resolve).
+    The request stays pending for the real backend."""
+    h = harness
+    make_job(h)
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv", list(argv))
+    for m in mods:
+        monkeypatch.setitem(sys.modules, m, type(sys)(m))
+    write_lease(h, os.getpid())     # even a self-held lease must not unlock
+    assert h.mod._webui_host_decision(SID) == (False, "gateway-runner")
+    h.mod._webui_poll_once()
+    assert drain(h.registry.completion_queue) == []
+    assert h.ledger == {}
+    assert on_disk(h)["state"] == "pending"
+
+
+def test_gateway_argv_overrides_the_backend_marker_and_webui_modules(
+        harness, monkeypatch):
+    """Rule order: the persistent gateway identity vetoes before any
+    positive marker is consulted (a real gateway imports
+    tui_gateway.server itself)."""
+    h = harness
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv",
+                        [sys.executable, "-m", "hermes_cli.main",
+                         "gateway", "run"])
+    monkeypatch.setitem(sys.modules, "tui_gateway.server",
+                        type(sys)("tui_gateway.server"))
+    monkeypatch.setitem(sys.modules, "api.background_process",
+                        type(sys)("api.background_process"))
+    assert h.mod._webui_host_decision(SID) == (False, "gateway-runner")
+
+
+def test_api_background_process_alone_is_webui_positive(harness, monkeypatch):
+    """api.background_process is a hermes-webui-only module: its presence
+    is a POSITIVE identity that a late gateway.run import cannot veto."""
+    h = harness
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv", list(PYTEST_ARGV))
+    monkeypatch.setitem(sys.modules, "api.background_process",
+                        type(sys)("api.background_process"))
+    monkeypatch.setitem(sys.modules, "gateway.run", type(sys)("gateway.run"))
+    assert h.mod._webui_host_decision(SID) == (True, "webui-positive")
+
+
+def test_tui_backend_role_hosts_and_marker_still_allowed(harness, monkeypatch):
+    h = harness
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv",
+                        [sys.executable, "-m", "tui_gateway.entry"])
+    assert h.mod._webui_host_decision(SID) == (True, "tui-backend")
+    # unknown role + tui_gateway.server alone: the legacy marker path keeps
+    # working (existing behaviour preserved)
+    monkeypatch.setattr(sys, "argv", list(PYTEST_ARGV))
+    monkeypatch.setitem(sys.modules, "tui_gateway.server",
+                        type(sys)("tui_gateway.server"))
+    assert h.mod._webui_host_decision(SID) == (True, "backend-marker")
+
+
+def test_unknown_role_loaded_gateway_run_still_vetoes(harness, monkeypatch):
+    """v0.4.1 behaviour preserved for argv-unknown processes: a loaded
+    gateway.run vetoes even a self-held lease."""
+    h = harness
+    monkeypatch.setattr(h.mod, "_webui_may_host", h.real_may_host)
+    monkeypatch.setattr(sys, "argv", list(PYTEST_ARGV))
+    monkeypatch.setitem(sys.modules, "gateway.run", type(sys)("gateway.run"))
+    write_lease(h, os.getpid())
+    assert h.mod._webui_host_decision(SID) == (False, "gateway-run-loaded")
+
+
+# ---------------------------------------------------------------------------
+# v0.4.2 durable attempt budget: failed attempts are NOT free
+# ---------------------------------------------------------------------------
+
+def test_transient_inject_failure_bumps_durable_attempts_and_retries(
+        harness, monkeypatch):
+    """A raised injection is still a REAL attempt: attempts+1 must be
+    persisted, the request returns to pending, and the retry succeeds all
+    the way to delivered."""
+    h = harness
+    jd = make_job(h)
+    boom = {"fail": True}
+    real = h.mod._webui_inject
+
+    def flaky(hermes, req):
+        if boom["fail"]:
+            boom["fail"] = False
+            raise RuntimeError("transient ledger failure")
+        return real(hermes, req)
+
+    monkeypatch.setattr(h.mod, "_webui_inject", flaky)
+
+    h.mod._webui_poll_once()
+    req = on_disk(h)
+    assert req["state"] == "pending" and req["attempts"] == 1
+
+    h.mod._webui_poll_once()
+    assert on_disk(h)["state"] == "injected" and on_disk(h)["attempts"] == 2
+    assert len(drain(h.registry.completion_queue)) == 1
+
+    h.ledger[f"pi-bridge-{JID_A}-t1"]["delivery_state"] = "delivered"
+    h.mod._webui_poll_once()
+    assert on_disk(h)["state"] == "delivered"
+    job = json.loads((jd / "job.json").read_text("utf-8"))
+    assert job["delivery"]["ok"] is True
+
+
+def test_vanished_ledger_row_reinjection_bumps_attempts(harness):
+    h = harness
+    make_job(h)
+    h.mod._webui_poll_once()
+    assert on_disk(h)["attempts"] == 1
+    drain(h.registry.completion_queue)
+    h.ledger.clear()                               # the row vanished
+
+    h.mod._webui_poll_once()
+
+    assert on_disk(h)["state"] == "injected"
+    assert on_disk(h)["attempts"] == 2             # the re-inject was real
+    assert len(drain(h.registry.completion_queue)) == 1
+
+
+def test_persistent_inject_failures_exhaust_env_cap_and_survive_restart(
+        harness, monkeypatch):
+    """Repeated raising attempts must reach 'abandoned' (job acked
+    ok=false), the cap comes from PI_BRIDGE_MAX_INJECTION_ATTEMPTS, and a
+    process restart (brand-new plugin module instance over the same spool)
+    must NOT reset the durable counter."""
+    h = harness
+    jd = make_job(h)
+    monkeypatch.setenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", "3")
+
+    def boom(hermes, req):
+        raise RuntimeError("persistent ledger failure")
+
+    def wire(mod):
+        monkeypatch.setattr(mod, "_webui_hermes", h.fake_hermes)
+        monkeypatch.setattr(mod, "_webui_may_host", lambda sid: True)
+        monkeypatch.setattr(mod, "_webui_inject", boom)
+        assert mod._WEBUI_MAX_ATTEMPTS == 3        # env override at import
+        return mod
+
+    mod1 = wire(_load_plugin("pi_worker_poller_cap1"))
+    mod1._webui_poll_once()
+    assert on_disk(h)["state"] == "pending" and on_disk(h)["attempts"] == 1
+
+    # simulated restart: a fresh module instance, same PI_BRIDGE_HOME
+    mod2 = wire(_load_plugin("pi_worker_poller_cap2"))
+    mod2._webui_poll_once()
+    assert on_disk(h)["attempts"] == 2
+    mod2._webui_poll_once()
+    assert on_disk(h)["attempts"] == 3
+    assert drain(h.registry.completion_queue) == []
+
+    mod2._webui_poll_once()                        # 3 >= cap -> abandoned
+    req = on_disk(h)
+    assert req["state"] == "abandoned"
+    assert req["reason"] == "injection-attempts-exhausted"
+    job = json.loads((jd / "job.json").read_text("utf-8"))
+    assert (job["delivery"]["attempted"], job["delivery"]["ok"],
+            job["delivery"]["reason"]) == (True, False,
+                                           "injection-attempts-exhausted")
+    assert drain(h.registry.completion_queue) == []
+
+
+def test_max_attempts_env_garbage_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", "not-an-int")
+    mod = _load_plugin("pi_worker_poller_garbage_cap")
+    assert mod._WEBUI_MAX_ATTEMPTS == 1200
+    monkeypatch.setenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS", "0")
+    mod = _load_plugin("pi_worker_poller_zero_cap")
+    assert mod._WEBUI_MAX_ATTEMPTS == 1200
+    monkeypatch.delenv("PI_BRIDGE_MAX_INJECTION_ATTEMPTS")
+    mod = _load_plugin("pi_worker_poller_default_cap")
+    assert mod._WEBUI_MAX_ATTEMPTS == 1200
+
+
+def test_stuck_spool_is_injected_by_a_fresh_plugin_module(harness, monkeypatch):
+    """Backend-restart recovery (the stuck production job): a pending spool
+    written BEFORE the plugin module exists is injected by the brand-new
+    module instance over the same PI_BRIDGE_HOME."""
+    h = harness
+    make_job(h)                                    # spool predates the module
+    assert on_disk(h)["state"] == "pending"
+
+    mod2 = _load_plugin("pi_worker_poller_recovery")
+    monkeypatch.setattr(mod2, "_webui_hermes", h.fake_hermes)
+    monkeypatch.setattr(mod2, "_webui_may_host", lambda sid: True)
+
+    mod2._webui_poll_once()
+    assert len(drain(h.registry.completion_queue)) == 1
+    assert on_disk(h)["state"] == "injected"
+    assert on_disk(h)["attempts"] == 1
