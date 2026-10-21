@@ -665,3 +665,37 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="m",reason="capacity"}
 SAMPLE_METRICS_IDLE = """vllm:num_requests_running{engine="0",model_name="m"} 0.0
 vllm:num_requests_waiting{engine="0",model_name="m"} 0.0
 """
+
+
+# ---------------------------------------------------------------------------
+# terminal-job observation cleanup (found in the v0.5.0 live smoke test:
+# a job can complete BEFORE the next tick confirms the recovery)
+# ---------------------------------------------------------------------------
+
+def test_terminal_job_finalizes_dangling_recovery(env, fixture_pi):
+    f = fixture_pi("hang")
+    assert tick(f.job_id)["action"] == "recovered-attempt"
+    assert wd(f.job_id)["state"] == "recovering"
+    # normal completion pipeline wins the race: job terminal, unconfirmed
+    with state.job_lock(f.job_id):
+        j = state.load_job(f.job_id)
+        j["status"] = "completed"
+        j["turns"][-1]["finished_at"] = state.now_iso()
+        state.save_job(j)
+    watchdog._tick()                       # one tick finalizes observation
+    w = wd(f.job_id)
+    assert w["state"] == "recovered" and w["recovered_at"]
+    assert state.load_job(f.job_id)["status"] == "completed"   # status untouched
+
+
+def test_terminal_failed_job_keeps_attention(env, fixture_pi):
+    f = fixture_pi("loop")
+    tick(f.job_id)                          # attempt 1 -> recovering
+    with state.job_lock(f.job_id):
+        j = state.load_job(f.job_id)
+        j["status"] = "failed"
+        j["turns"][-1]["finished_at"] = state.now_iso()
+        state.save_job(j)
+    watchdog._tick()
+    # a FAILED end is not "recovered": the attention flag stays visible
+    assert wd(f.job_id)["state"] == "needs_attention"

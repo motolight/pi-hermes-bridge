@@ -661,10 +661,17 @@ def stall_route_install(secret: str, port: int = DEFAULT_PORT,
         return {"route": "wake-route-missing", "restart_needed": False,
                 "error": "platforms.webhook.extra absent: run route-install first"}
     routes = extra.get("routes")
-    if not isinstance(routes, dict) or ROUTE_NAME not in routes:
+    if not isinstance(routes, dict):
         return {"route": "wake-route-missing", "restart_needed": False,
-                "error": f"completion route {ROUTE_NAME!r} absent: run "
-                         "route-install first"}
+                "error": "platforms.webhook.extra.routes absent: run "
+                         "route-install (the completion route) first"}
+    # The completion route may carry ANY name (custom/manual wake setups use
+    # e.g. 'pi-bridge-wake'); what matters is that the platform exists and
+    # already carries routes -- we only ever ADD our own route to it.
+    if ROUTE_NAME not in routes and not wake.get("route_owned") \
+            and not routes:
+        return {"route": "wake-route-missing", "restart_needed": False,
+                "error": "no webhook routes at all: run route-install first"}
     host = str(extra.get("host", "127.0.0.1"))
     if host not in ("127.0.0.1", "localhost", "::1") and not allow_non_loopback:
         raise BridgeError(

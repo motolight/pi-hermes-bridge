@@ -1276,6 +1276,30 @@ def tick() -> dict:
             pass
 
 
+def _finalize_terminal(job: dict) -> None:
+    """A job that TERMINATED while the watchdog was observing a recovery:
+    it reached a real end-of-turn, which is the strongest possible proof
+    that the session resumed -- finalize the dangling observation instead
+    of leaving a stale 'recovering'/'needs_attention' in pi_status.  Only
+    the watchdog block is touched, and only while it is non-final."""
+    wd = normalize_state(job)
+    if wd["state"] not in ("recovering", "needs_attention", "diagnosing",
+                           "suspected_stall"):
+        return
+    def fn(w, j):
+        if j["status"] in state.TERMINAL_STATUSES and \
+                w["state"] in ("recovering", "needs_attention", "diagnosing",
+                               "suspected_stall"):
+            w["state"] = "recovered" if j["status"] == "completed" \
+                else "needs_attention" if j["status"] == "failed" \
+                else w["state"]
+            if w["state"] == "recovered" and not w["recovered_at"]:
+                w["recovered_at"] = state.now_iso()
+            return
+        return False
+    _mutate(job["job_id"], fn)
+
+
 def _tick() -> dict:
     cfg = load_config()
     events = flush_events(cfg)
@@ -1288,6 +1312,7 @@ def _tick() -> dict:
     scanned = 0
     for job in state.list_jobs():
         if job.get("status") not in state.ACTIVE_STATUSES:
+            _finalize_terminal(job)   # observation cleanup only
             continue  # terminal jobs belong to the completion pipeline
         # cheap pre-filter: never sample a job whose runner is gone
         if not runner_alive(job):

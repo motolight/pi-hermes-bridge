@@ -321,6 +321,15 @@ def main(argv=None) -> int:
                     # (wake.json already carries it; no second secret invented)
                     secret, _cfg_port = hsetup.route_secret_in_config()
                 if not secret:
+                    # route name beyond the bridge's known one (e.g. a custom
+                    # manual 'pi-bridge-wake'): the bridge wake.json itself is
+                    # the last legitimate source of the platform secret
+                    try:
+                        secret = str(json.loads(
+                            hsetup.wake_json_path().read_text()).get("secret") or "")
+                    except Exception:
+                        secret = ""
+                if not secret:
                     raise BridgeError("no wake secret: run route-install first")
                 port = int(st.get("wake", {}).get("port") or hsetup.DEFAULT_PORT)
                 res = hsetup.stall_route_install(secret, port=port,

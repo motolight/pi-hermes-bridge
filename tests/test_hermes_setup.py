@@ -394,10 +394,35 @@ def _seed_cfg(sb):
     hs.config_path().write_text(FOREIGN_CFG)
 
 
-def test_stall_route_requires_completion_route_first(sb):
-    _seed_cfg(sb)
+def test_stall_route_requires_webhook_platform_first(sb):
+    # no platforms.webhook at all -> refuse (never create a platform here)
     r = hs.stall_route_install("sec" * 20, port=9100)
     assert r["route"] == "wake-route-missing"
+
+
+def test_stall_route_adds_to_custom_named_wake_route(sb):
+    # production-style manual setup: wake route is named pi-bridge-wake
+    hs.config_path().write_text("""\
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8644
+      secret: global-x
+      routes:
+        pi-bridge-wake:
+          secret: custom-route-secret-long-enough
+          events: [pi_bridge_turn_complete]
+          deliver: log
+""")
+    r = hs.stall_route_install("custom-route-secret-long-enough", port=8644)
+    assert r["route"] == "created_route"
+    doc = _yaml().load(hs.config_path().read_text())
+    routes = doc["platforms"]["webhook"]["extra"]["routes"]
+    assert routes["pi-bridge-wake"]["secret"] == "custom-route-secret-long-enough"
+    assert routes[hs.STALL_ROUTE_NAME]["secret"] == "custom-route-secret-long-enough"
+    assert list(routes[hs.STALL_ROUTE_NAME]["events"]) == [hs.STALL_EVENT]
 
 
 def test_stall_route_install_update_remove_roundtrip(sb):
