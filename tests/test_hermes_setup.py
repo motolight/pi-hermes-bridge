@@ -385,3 +385,118 @@ def test_write_preserves_existing_file_mode(sb):
     assert stat.S_IMODE(hs.config_path().stat().st_mode) == 0o664
     # our fully-owned new files stay 0600
     assert stat.S_IMODE(hs.state_path().stat().st_mode) == 0o600
+
+
+# ------------------------------------------------------- stall route (v0.5.0)
+
+def _seed_cfg(sb):
+    hs.config_path().parent.mkdir(parents=True, exist_ok=True)
+    hs.config_path().write_text(FOREIGN_CFG)
+
+
+def test_stall_route_requires_completion_route_first(sb):
+    _seed_cfg(sb)
+    r = hs.stall_route_install("sec" * 20, port=9100)
+    assert r["route"] == "wake-route-missing"
+
+
+def test_stall_route_install_update_remove_roundtrip(sb):
+    _seed_cfg(sb)
+    hs.route_install("sec" * 20, port=9100)
+    r = hs.stall_route_install("sec" * 20, port=9100)
+    assert r["route"] == "created_route"
+    doc = _yaml().load(hs.config_path().read_text())
+    routes = doc["platforms"]["webhook"]["extra"]["routes"]
+    sr = routes[hs.STALL_ROUTE_NAME]
+    assert list(sr["events"]) == [hs.STALL_EVENT]
+    assert sr["deliver"] == "log"
+    assert sr["secret"] == "sec" * 20
+    assert "pi_recover" in sr["prompt"] and "READ-ONLY" in sr["prompt"]
+    # foreign route and global settings untouched
+    assert routes["other-team-route"]["secret"] == "foreign-secret"
+    assert doc["platforms"]["webhook"]["extra"]["secret"] == "foreign-global"
+    # idempotent second install
+    assert hs.stall_route_install("sec" * 20, port=9100)["route"] == "unchanged"
+    # removal takes ONLY the stall route
+    rr = hs.stall_route_remove()
+    assert rr["route"] == "removed"
+    doc = _yaml().load(hs.config_path().read_text())
+    routes = doc["platforms"]["webhook"]["extra"]["routes"]
+    assert hs.STALL_ROUTE_NAME not in routes
+    assert hs.ROUTE_NAME in routes and "other-team-route" in routes
+
+
+def _yaml():
+    from ruamel.yaml import YAML
+    return YAML(typ="safe")
+
+
+def test_stall_route_never_touches_foreign_route_named_stall(sb):
+    _seed_cfg(sb)
+    hs.route_install("sec" * 20, port=9100)
+    # someone else already owns a route with our stall name -> kept_manual
+    doc = hs._Yaml(); d = doc.load(hs.config_path())
+    d["platforms"]["webhook"]["extra"]["routes"][hs.STALL_ROUTE_NAME] = \
+        doc.Map({"secret": "theirs", "events": ["x"]})
+    doc.save(d, hs.config_path())
+    r = hs.stall_route_install("sec" * 20, port=9100)
+    assert r["route"] == "kept_manual"
+    d2 = hs._Yaml().load(hs.config_path())
+    assert d2["platforms"]["webhook"]["extra"]["routes"][
+        hs.STALL_ROUTE_NAME]["secret"] == "theirs"
+
+
+# ------------------------------------------------------ watchdog units (v0.5)
+
+class _FakeCtl:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        import subprocess as sp
+        return sp.CompletedProcess(args, 0, "", "")
+
+
+def test_watchdog_units_install_remove_roundtrip(sb, monkeypatch):
+    ctl = _FakeCtl()
+    monkeypatch.setattr(hs, "_systemctl_user", ctl)
+    cli = "/opt/bridge/.venv/bin/pi-bridge"
+    r = hs.watchdog_install(cli, hs.bridge_home())
+    assert r["watchdog_units"] == "installed"
+    d = hs.systemd_user_dir()
+    svc = (d / hs.WATCHDOG_SERVICE).read_text()
+    tmr = (d / hs.WATCHDOG_TIMER).read_text()
+    assert f"{cli} watchdog tick" in svc and "Type=oneshot" in svc
+    assert "OnUnitActiveSec=1min" in tmr
+    assert ("enable", "--now", hs.WATCHDOG_TIMER) in ctl.calls
+    st = hs.load_state()
+    assert st["watchdog"]["units_owned"] is True
+    # state dir removal on uninstall: bridge-owned watchdog dir goes, jobs stay
+    wd = hs.bridge_home() / "watchdog"
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "heartbeat.json").write_text("{}")
+    jobs = hs.bridge_home() / "jobs"
+    jobs.mkdir()
+    (jobs / "keep.txt").write_text("history")
+    r2 = hs.watchdog_remove()
+    assert r2["watchdog_units"] == "removed"
+    assert not (d / hs.WATCHDOG_SERVICE).exists()
+    assert not wd.exists()
+    assert (jobs / "keep.txt").read_text() == "history"   # history preserved
+    assert ("disable", "--now", hs.WATCHDOG_TIMER) in ctl.calls
+
+
+def test_watchdog_remove_never_deletes_foreign_units(sb, monkeypatch):
+    ctl = _FakeCtl()
+    monkeypatch.setattr(hs, "_systemctl_user", ctl)
+    d = hs.systemd_user_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / hs.WATCHDOG_SERVICE).write_text("[Unit]\nDescription=someone else's\n")
+    hs.save_state({"watchdog": {"units_owned": True,
+                                "service_path": str(d / hs.WATCHDOG_SERVICE),
+                                "timer_path": str(d / hs.WATCHDOG_TIMER)}})
+    r = hs.watchdog_remove()
+    assert r["watchdog_units"] == "removed"
+    # content-based ownership: a foreign file WITHOUT our mark survives
+    assert "someone else's" in (d / hs.WATCHDOG_SERVICE).read_text()

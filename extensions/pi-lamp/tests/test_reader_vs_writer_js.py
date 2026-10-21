@@ -7,7 +7,9 @@ asserts that the shipped assets/pi-lamp.js renders exactly that — so a writer
 that changes a `group`, a threshold or a timestamp format without the reader
 following fails here instead of in the browser.  Since writer 1.3 that also
 covers the `hermes` delivery state: an amber (awaiting) and a red (abandoned
-completion) job ride along in the snapshot.  Skipped when node is absent.
+completion) job ride along in the snapshot.  Since writer 1.4 it also covers
+the stall-watchdog row colours: a running job the watchdog is checking, and one
+it has just recovered.  Skipped when node is absent.
 """
 import shutil
 import subprocess
@@ -21,11 +23,14 @@ SRC = HERE.parent
 sys.path.insert(0, str(HERE))
 
 from test_writer import (JOB_B, JOB_C, JOB_D, JOB_E, JOB_OK, _turns,  # noqa: E402
-                         _webui_event, make_job, run_writer)
+                         _webui_event, _wd, make_job, run_writer)
 
 # extra synthetic jobs for the 1.3 delivery-honesty shapes
 JOB_F = "pb-20260101T000005Z-ffffff"
 JOB_G = "pb-20260101T000006Z-abcdef"
+# and for the 1.4 stall-watchdog row colours (both ACTIVE, both in chat sess-a)
+JOB_H = "pb-20260101T000007Z-a1b2c3"
+JOB_I = "pb-20260101T000008Z-c3d4e5"
 
 
 def test_reader_agrees_with_writer_on_a_real_snapshot(tmp_path):
@@ -57,6 +62,11 @@ def test_reader_agrees_with_writer_on_a_real_snapshot(tmp_path):
     make_job(root, JOB_G, status="completed", updated=str(-5 * 3600),
              delivery=_webui_event("injection-attempts-exhausted"),
              turns=_turns(finished_off=-5 * 3600))
+    # chat sess-a: two more RUNNING jobs carrying the bridge's stall-watchdog
+    # block (writer 1.4) — one the watchdog is silently checking (amber pulse)
+    # and one it has just brought back (blue again)
+    make_job(root, JOB_H, watchdog=_wd("suspected_stall"))
+    make_job(root, JOB_I, watchdog=_wd("recovered"))
 
     snapshot = tmp_path / "status.json"
     data = run_writer(tmp_path, root)
@@ -71,6 +81,15 @@ def test_reader_agrees_with_writer_on_a_real_snapshot(tmp_path):
     # a synchronous send): unchanged, `state` null, quiet as always
     assert by_id[JOB_C]["hermes"]["state"] is None
     assert by_id[JOB_D]["hermes"]["state"] is None and by_id[JOB_D]["group"] == "quiet"
+    # stall watchdog (writer 1.4): the row colour the reader must reproduce,
+    # with `view` and `group` untouched in both cases
+    assert (by_id[JOB_H]["view"], by_id[JOB_H]["group"]) == ("running", "active")
+    assert (by_id[JOB_H]["watchdog"]["state"],
+            by_id[JOB_H]["watchdog"]["wd_view"]) == ("suspected_stall", "checking")
+    assert (by_id[JOB_I]["view"], by_id[JOB_I]["group"]) == ("running", "active")
+    assert (by_id[JOB_I]["watchdog"]["state"],
+            by_id[JOB_I]["watchdog"]["wd_view"]) == ("recovered", None)
+    assert "watchdog" not in by_id[JOB_OK]        # an untracked job says nothing
 
     r = subprocess.run(
         [node, str(HERE / "js" / "smoke.js"), str(SRC / "assets" / "pi-lamp.js"), str(snapshot)],

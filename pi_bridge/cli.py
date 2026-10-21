@@ -9,6 +9,10 @@ pi-bridge feedback JOB_ID [--feedback TEXT | --feedback-file F]  (default: on st
 pi-bridge cancel   JOB_ID [--json]
 pi-bridge list     [--limit N] [--json]
 pi-bridge health   [--json]  (read-only poller health records, one row per live poller pid)
+pi-bridge watchdog tick      (one stall-watchdog evaluation pass; systemd-timer entry point)
+pi-bridge watchdog status [--json]  (read-only watchdog heartbeat + per-job watchdog state)
+pi-bridge recover  JOB_ID [--json]  (tier-1 stall recovery: interrupt ONLY verified descendant
+                   tool commands of that one bridge job; never Pi, never arbitrary PIDs)
 pi-bridge web-info JOB_ID   (read-only PI WEB observability view, JSON)
 """
 from __future__ import annotations
@@ -114,6 +118,18 @@ def main(argv=None) -> int:
     p.add_argument("--force", action="store_true",
                    help="overwrite even a wake.json we do not own")
     p.add_argument("--json", action="store_true")
+    p = hs_sub.add_parser("stall-route-install",
+                          help="insert/update the bridge-owned stall webhook route")
+    p.add_argument("--allow-non-loopback-webhook", action="store_true",
+                   help="explicitly accept a non-loopback platform bind (NOT recommended)")
+    p.add_argument("--json", action="store_true")
+    p = hs_sub.add_parser("stall-route-remove",
+                          help="remove only the bridge-owned stall route")
+    p.add_argument("--json", action="store_true")
+    hs_sub.add_parser("watchdog-install",
+                      help="install + enable the bridge-owned watchdog systemd units")
+    hs_sub.add_parser("watchdog-remove",
+                      help="disable + remove only the bridge-owned watchdog units + state")
     p = hs_sub.add_parser("wake-disable", help="disable (or remove, if owned) wake.json")
     p.add_argument("--keep", action="store_true", help="disable in place instead of removing")
     p.add_argument("--json", action="store_true")
@@ -140,6 +156,20 @@ def main(argv=None) -> int:
                              "(one row per live poller process)")
     ht.add_argument("--json", action="store_true",
                     help="dump the raw record list as JSON")
+
+    wd = sub.add_parser("watchdog",
+                        help="stall watchdog: timer tick + read-only status")
+    wd_sub = wd.add_subparsers(dest="wd_cmd", required=True)
+    wd_sub.add_parser("tick", help="run one evaluation pass (timer entry point)")
+    wds = wd_sub.add_parser("status", help="read-only watchdog heartbeat + per-job state")
+    wds.add_argument("--json", action="store_true")
+
+    rc = sub.add_parser("recover",
+                        help="tier-1 stall recovery for one bridge job: SIGTERM "
+                             "then SIGKILL ONLY its verified descendant tool "
+                             "commands; the Pi process and session stay alive")
+    rc.add_argument("job_id")
+    rc.add_argument("--json", action="store_true")
 
     args = ap.parse_args(argv)
     try:
@@ -179,6 +209,20 @@ def main(argv=None) -> int:
             print(json.dumps(bridge.piweb_view(job), ensure_ascii=False))
         elif args.cmd == "health":
             from . import health as health_mod
+            from . import watchdog as wdog_mod
+            if not args.json:
+                # human view only: `health --json` keeps its exact V1.5
+                # record-list shape (plugin/tests parse it)
+                hb = wdog_mod.heartbeat()
+                if hb:
+                    print(f"stall watchdog: last tick {hb.get('last_tick_at', '?')}"
+                          f"  scanned={hb.get('scanned', 0)}"
+                          f"  states={json.dumps(hb.get('states') or {}, ensure_ascii=False)}"
+                          f"  events={json.dumps(hb.get('events') or {}, ensure_ascii=False)}")
+                else:
+                    print("stall watchdog: no tick recorded "
+                          "(install the timer with ./install.sh, or run "
+                          "`pi-bridge watchdog tick` manually)")
             recs = health_mod.read_records(state.bridge_home())
             if args.json:
                 print(json.dumps(recs, ensure_ascii=False))
@@ -211,6 +255,22 @@ def main(argv=None) -> int:
                           f"del={c.get('delivered', 0)} "
                           f"abn={c.get('abandoned', 0)} "
                           f"rej={c.get('gate_rejected', 0)}")
+        elif args.cmd == "recover":
+            from . import watchdog as wdog
+            result = wdog.recover(args.job_id, trigger="cli")
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                print(json.dumps(result, ensure_ascii=False))
+            if not result.get("ok"):
+                return 2
+        elif args.cmd == "watchdog":
+            from . import watchdog as wdog
+            if args.wd_cmd == "tick":
+                out = wdog.tick()
+                print(json.dumps(out, ensure_ascii=False))
+            else:
+                print(json.dumps(wdog.status_view(), ensure_ascii=False))
         elif args.cmd == "hermes-setup":
             from pathlib import Path as _Path
             from . import hermes_setup as hsetup
@@ -253,6 +313,29 @@ def main(argv=None) -> int:
                 res = hsetup.wake_write(secret, port, force=args.force, url_host=url_host)
             elif args.hs_cmd == "wake-disable":
                 res = hsetup.wake_disable(remove=not args.keep)
+            elif args.hs_cmd == "stall-route-install":
+                st = hsetup.load_state()
+                secret = str(st.get("wake", {}).get("secret", ""))
+                if not secret:
+                    # manual/v0.1 wake setup: reuse the existing route secret
+                    # (wake.json already carries it; no second secret invented)
+                    secret, _cfg_port = hsetup.route_secret_in_config()
+                if not secret:
+                    raise BridgeError("no wake secret: run route-install first")
+                port = int(st.get("wake", {}).get("port") or hsetup.DEFAULT_PORT)
+                res = hsetup.stall_route_install(secret, port=port,
+                                                 allow_non_loopback=args.allow_non_loopback_webhook)
+            elif args.hs_cmd == "stall-route-remove":
+                res = hsetup.stall_route_remove()
+            elif args.hs_cmd == "watchdog-install":
+                import shutil as _sh2
+                cli_path = (_sh2.which(str(_Path(__file__).resolve().parent.parent
+                                          / ".venv" / "bin" / "pi-bridge"))
+                            or str(_Path(__file__).resolve().parent.parent
+                                   / ".venv" / "bin" / "pi-bridge"))
+                res = hsetup.watchdog_install(cli_path, state.bridge_home())
+            elif args.hs_cmd == "watchdog-remove":
+                res = hsetup.watchdog_remove()
             elif args.hs_cmd == "state":
                 def _redact(x):
                     if isinstance(x, dict):

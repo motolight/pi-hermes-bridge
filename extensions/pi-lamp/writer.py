@@ -23,6 +23,24 @@ or null when the Hermes side is unknowable (no delivery record, a `send`
 /telegram delivery, an unrecognised shape): the lamp then renders exactly as
 it did in 1.2.
 
+Since 1.4 an ACTIVE job whose job.json carries the bridge's stall-watchdog
+block also carries `watchdog` = {state, wd_view, suspicion_age_s, attempts,
+diagnosis_summary, last_action_at, recovered_at, needs_attention_at}.  `state`
+is the watchdog's own state (healthy | suspected_stall | diagnosing |
+recovering | recovered | needs_attention; anything invalid reads as
+"healthy") and `wd_view` is the browser-facing view derived from it:
+
+  suspected_stall / diagnosing -> "checking"    (amber, pulsing)
+  recovering                   -> "recovering"  (orange)
+  needs_attention              -> "attention"   (red, never time-quieted)
+  healthy / recovered / absent -> null          (blue, normal working)
+
+`watchdog` is strictly additive: it appears only when job.json really holds a
+watchdog dict (a malformed one is treated as absent, never a crash), it never
+moves `view` or `group`, and an old reader ignores it.  The diagnosis summary
+is capped at 300 chars and path-redacted like `error`; no cmdline text ever
+leaves the box.
+
 Output (atomic): PI_LAMP_OUT (default
 ~/.hermes/webui/extensions/pi-lamp/status.json), fetched by the pi-lamp
 extension JS same-origin at /extensions/pi-lamp/status.json.
@@ -41,7 +59,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 JOB_ID_RE = re.compile(r"^pb-\d{8}T\d{6}Z-[0-9a-f]{6}$")
 UNIT_RE = re.compile(r"^pi-bridge-pb-\d{8}T\d{6}Z-[0-9a-f]{6}-t\d{1,4}$")
@@ -659,16 +677,89 @@ _PATH_RE = re.compile(r"/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)*")
 _HOME_RE = re.compile(r"~/[A-Za-z0-9._~+/-]+")
 
 
+def _redact_text(err, limit: int, pre: int | None = None) -> str | None:
+    """Short, path-free line for status.json, which is served over HTTP and
+    must not carry the local filesystem layout."""
+    if not err:
+        return None
+    s = str(err)[:pre if pre is not None else limit].replace(str(Path.home()), "~")
+    s = _HOME_RE.sub("<path>", s)
+    s = _PATH_RE.sub("<path>", s)
+    s = s[:limit]
+    return re.sub(r"<p(?:a(?:t(?:h)?)?)?$", "", s)  # never end on a cut placeholder
+
+
 def redact_error(err) -> str | None:
     """Short, path-free error line for the card: status.json is served over
     HTTP and must not carry the local filesystem layout."""
-    if not err:
+    return _redact_text(err, 200, pre=400)
+
+
+# ------------------------------------------------ stall watchdog (writer 1.4)
+#
+# The bridge's stall watchdog keeps its state in an additive `watchdog` block
+# inside job.json.  For an ACTIVE job the lamp mirrors it, so a row can say
+# "the bridge is silently checking / recovering / has given up" instead of
+# just "silent for 12 minutes".  Everything here is defensive: a hand-edited
+# or half-written block must degrade to "no watchdog at all" — which is
+# exactly writer 1.3's rendering — never to a lost snapshot tick.
+
+WATCHDOG_STATES = frozenset({"healthy", "suspected_stall", "diagnosing",
+                             "recovering", "recovered", "needs_attention"})
+# The browser-facing view, and the colour contract it drives in pi-lamp.css:
+# checking = amber pulse, recovering = orange, attention = red, null = blue.
+WATCHDOG_VIEWS = {"suspected_stall": "checking", "diagnosing": "checking",
+                  "recovering": "recovering", "needs_attention": "attention"}
+WD_TEXT_MAX = 300              # longest diagnosis text ever written out
+
+
+def _wd_num(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    s = str(err)[:400].replace(str(Path.home()), "~")
-    s = _HOME_RE.sub("<path>", s)
-    s = _PATH_RE.sub("<path>", s)
-    s = s[:200]
-    return re.sub(r"<p(?:a(?:t(?:h)?)?)?$", "", s)  # never end on a cut placeholder
+    return round(float(v), 1)
+
+
+def _wd_int(v) -> int:
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wd_str(v):
+    return v if isinstance(v, str) and v else None
+
+
+def watchdog_view(job) -> dict | None:
+    """Additive watchdog view for one raw job dict (pure), or None when the
+    job has no usable watchdog block."""
+    if not isinstance(job, dict):
+        return None
+    raw = job.get("watchdog")
+    if not isinstance(raw, dict):
+        return None                    # absent or not a dict: exactly writer 1.3
+    state = raw.get("state")
+    if not isinstance(state, str) or state not in WATCHDOG_STATES:
+        state = "healthy"              # an unknown state is not an opinion
+    diag = raw.get("diagnosis")
+    summary = diag.get("summary") if isinstance(diag, dict) else None
+    if not (isinstance(summary, str) and summary.strip()):
+        summary = None                    # only a real string leaves the box
+    last_action = raw.get("last_action")
+    return {
+        "state": state,
+        "wd_view": WATCHDOG_VIEWS.get(state),
+        "suspicion_age_s": _wd_num(raw.get("suspicion_age_s")),
+        "attempts": _wd_int(raw.get("attempts")),
+        # capped + path-redacted; `last_action` itself (pids, cmdlines) never
+        # leaves the box, only the timestamp of it
+        "diagnosis_summary": (_redact_text(summary, WD_TEXT_MAX)
+                              if isinstance(summary, str) else None),
+        "last_action_at": (_wd_str(last_action.get("at"))
+                           if isinstance(last_action, dict) else None),
+        "recovered_at": _wd_str(raw.get("recovered_at")),
+        "needs_attention_at": _wd_str(raw.get("needs_attention_at")),
+    }
 
 
 def job_view(job_dir: Path, job: dict, now: float, cache: dict, budget: Budget) -> dict | None:
@@ -749,6 +840,13 @@ def job_view(job_dir: Path, job: dict, now: float, cache: dict, budget: Budget) 
                          "reason": delivery.get("reason"),
                          "kind": delivery.get("kind")}
         out["group"] = group_of(view, out["finished_age_s"], hstate)
+    if status in ACTIVE_STATUSES:
+        # The stall watchdog only ever speaks about a job the bridge still
+        # considers active (queued/running).  Additive: it never moves `view`
+        # or `group`, and a job with no usable block carries no key at all.
+        wv = watchdog_view(job)
+        if wv:
+            out["watchdog"] = wv
     try:
         pwv = piweb_view(job, cache, now, budget)
     except Exception:

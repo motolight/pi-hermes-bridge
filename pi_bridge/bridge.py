@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import deliver, piweb, state, wake
+from . import deliver, piweb, state, wake, watchdog as wdog
 from .state import BridgeError
 
 # Max chars of the final result kept inside job.json / returned by status.
@@ -553,6 +553,10 @@ def status_view(job: dict, full: bool = False) -> dict:
         "delivery": deliver.normalize_state(job),
         # Delivery origin as recorded at submit time (dict or null).
         "origin": job.get("origin") or None,
+        # Stall-watchdog view (v0.5.0, additive): state, last activity,
+        # suspicion age, diagnosis summary, recovery attempts/last action,
+        # recovered_at / needs_attention_at.  Never affects job semantics.
+        "watchdog": wdog.job_view(job),
         "log_dir": str(state.job_dir(job["job_id"])),
         "final_result_chars": job.get("final_result_chars") or 0,
         "final_result_truncated": bool(job.get("final_result_truncated"))
@@ -600,6 +604,10 @@ def list_rows(jobs: list[dict], limit: int = LIST_LIMIT_DEFAULT) -> list[dict]:
             "delivery": {k: v for k, v in deliver.normalize_state(job).items()
                          if k in ("attempted", "ok", "channel", "reason")},
             "origin": job.get("origin") or None,
+            # watchdog state only (v0.5.0, additive): a recovery run can
+            # see at a glance which job is being watched/recovering.
+            "watchdog": {"state": wdog.normalize_state(job)["state"],
+                         "attempts": wdog.normalize_state(job)["attempts"]},
         })
     rows.sort(key=lambda r: (r.get("updated_at") or "", r.get("job_id") or ""),
               reverse=True)

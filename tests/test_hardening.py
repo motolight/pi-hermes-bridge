@@ -169,7 +169,7 @@ def test_plugin_contract_and_e2e(env, workdir, monkeypatch):
 
     mod.register(Ctx())
     assert sorted(registered) == ["pi_cancel", "pi_delegate", "pi_feedback",
-                                  "pi_list", "pi_status"]
+                                  "pi_list", "pi_recover", "pi_status"]
 
     # handler contract: bad args -> JSON error string, never raises
     for name, h in registered.items():

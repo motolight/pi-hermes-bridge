@@ -12,6 +12,12 @@
  *   no running job    -> a static "Pi: N" pill counting the finished/failed
  *                        jobs of the last day that are still unacknowledged.
  *                        N == 0  -> no badge at all.
+ * The row colour of a running job follows the bridge's stall watchdog when it
+ * has one (writer >= 1.4 `watchdog` field): blue while it works, an amber
+ * pulse while the watchdog silently checks, orange while it recovers the job,
+ * red when the watchdog gave up and a human is needed.  The badge stays a
+ * counter (blue/blinking while anything runs, with the red pip for failures).
+ *
  *   finished, but Hermes has not received the completion yet (writer >= 1.3
  *                        `hermes.state == "awaiting"`) -> the same counter in
  *                        AMBER: "Pi done · waiting for Hermes", because green
@@ -94,6 +100,53 @@
     const r = h.reason != null ? h.reason : (j.delivery && j.delivery.reason);
     return (typeof r === 'string' && r) ? r : (fallback || 'unknown');
   }
+  /* Stall watchdog (writer >= 1.4): an ACTIVE job may carry
+   * `watchdog` = {state, wd_view, suspicion_age_s, attempts, diagnosis_summary,
+   * last_action_at, recovered_at, needs_attention_at}.  `wd_view` is the
+   * colour contract, decided server-side:
+   *   "checking"   – the bridge suspects a stall and is silently checking
+   *                 (amber, pulsing): Pi may well be fine;
+   *   "recovering" – the watchdog is terminating the stuck work (orange);
+   *   "attention"  – it gave up and a human is needed (red, and never
+   *                 time-quieted while the job is still active);
+   *   null         – healthy, or freshly recovered: ordinary blue.
+   * A missing/malformed block (writer < 1.4, an untracked job) must render
+   * exactly as before — feature-checked, never assumed. */
+  const WD_VIEWS = { checking: 1, recovering: 1, attention: 1 };
+  const WD_STATES = { healthy: 1, suspected_stall: 1, diagnosing: 1,
+                      recovering: 1, recovered: 1, needs_attention: 1 };
+  function wdField(j) {
+    const w = j && j.watchdog;
+    return (w && typeof w === 'object') ? w : null;
+  }
+  function wdView(j) {
+    const w = wdField(j);
+    if (!w) return null;
+    // own-property lookup only: a wd_view of "toString" must not read as known
+    const v = w.wd_view;
+    return (typeof v === 'string'
+      && Object.prototype.hasOwnProperty.call(WD_VIEWS, v)) ? v : null;
+  }
+  function wdState(j) {
+    const w = wdField(j);
+    if (!w) return null;
+    const s = w.state;
+    return (typeof s === 'string'
+      && Object.prototype.hasOwnProperty.call(WD_STATES, s)) ? s : null;
+  }
+  // Row label + its colour class, per watchdog state.
+  const WD_LABEL = {
+    checking: ['watchdog: checking…', 'pilamp-wd--checking'],
+    recovering: ['watchdog: recovering…', 'pilamp-wd--recovering'],
+    attention: ['watchdog: NEEDS ATTENTION', 'pilamp-wd--attention'],
+    recovered: ['watchdog: recovered', 'pilamp-wd--recovered'],
+  };
+  function wdLabel(j) {
+    const view = wdView(j);
+    const key = view || (wdState(j) === 'recovered' ? 'recovered' : null);
+    return key ? (Object.prototype.hasOwnProperty.call(WD_LABEL, key) ? WD_LABEL[key] : null) : null;
+  }
+
   // The card line that says, in words, whether Hermes got the result.
   function hermesLine(j) {
     const st = hermesState(j);
@@ -265,7 +318,9 @@
     const hs = hermesState(j);
     // A completion that is still waiting for Hermes, or that Hermes will
     // never get, is actionable: time must not hide it, whatever the group.
-    const actionable = hs === 'awaiting' || hs === 'failed';
+    // A watchdog that has given up on a job is equally actionable (defensive:
+    // the writer never files an active job as quiet, but a stale snapshot may).
+    const actionable = hs === 'awaiting' || hs === 'failed' || wdView(j) === 'attention';
     if (typeof j.group === 'string' && GROUPS[j.group]) {
       if (j.group === 'quiet' && actionable) return 'recent';
       return j.group;
@@ -600,20 +655,43 @@
   }
 
   function runningItem(s, j) {
-    const it = itemBox('pilamp-item--' + j.view);
+    const wv = wdView(j);
+    const wlbl = wdLabel(j);
+    // The watchdog colour overrides the plain running/stalled border: checking
+    // pulses amber, recovering is orange, attention is red — and a job the
+    // watchdog just brought back is blue again (wd_view null, state recovered).
+    const it = itemBox('pilamp-item--' + j.view
+      + (wv ? ' pilamp-item--wd-' + wv : (wlbl ? ' pilamp-item--wd-recovered' : '')));
     const l1 = el('pilamp-item-main');
     l1.appendChild(el('pilamp-item-id', j.job_id));
     if (j.view === 'stalled') l1.appendChild(el('pilamp-warn', ' · silent ' + fmtDur(j.activity_age_s)));
     else l1.appendChild(el('pilamp-dim', ' · ' + VIEW_LABEL[j.view]));
+    if (wlbl) l1.appendChild(el('pilamp-wd ' + wlbl[1], ' · ' + wlbl[0]));
     it.appendChild(l1);
     const bits = [fmtDur(j.duration_s) + ' elapsed'];
     if (j.turn_n != null) bits.push('turn #' + j.turn_n + (j.turn_kind ? ' · ' + j.turn_kind : '')
       + ' of ' + (j.turns_total || j.turn_n));
     if (j.result_chars) bits.push(j.result_chars + ' chars so far');
     it.appendChild(el('pilamp-item-sub', bits.join(' · ')));
+    const wsub = wdSubLine(j);
+    if (wsub) it.appendChild(el('pilamp-item-sub pilamp-wd-detail', wsub));
     const link = piwebRow(j);
     if (link) it.appendChild(link);
     s.body.appendChild(it);
+  }
+
+  // One extra line with what the watchdog itself reported (writer >= 1.4):
+  // how long it has suspected, how many recoveries it has spent, and its
+  // diagnosis.  The summary arrives capped and path-redacted from the writer.
+  function wdSubLine(j) {
+    const w = wdField(j);
+    if (!w || !(wdView(j) || wdState(j) === 'recovered')) return null;
+    const bits = [];
+    if (Number(w.suspicion_age_s) > 0) bits.push('suspected ' + fmtDur(w.suspicion_age_s));
+    if (Number(w.attempts) > 0) bits.push('attempt ' + Number(w.attempts));
+    if (typeof w.diagnosis_summary === 'string' && w.diagnosis_summary)
+      bits.push(w.diagnosis_summary);
+    return bits.length ? 'watchdog · ' + bits.join(' · ') : null;
   }
 
   function piwebRow(j) {

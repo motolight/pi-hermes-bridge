@@ -46,6 +46,28 @@ delivery, or an unrecognised shape). `"awaiting"` renders the static counter in
 Hermes gave up on is a problem row (red, never time-quieted,
 Acknowledge-only); `null` renders exactly as writer 1.2 did.
 
+**Writer 1.4 (stall watchdog).** An **active** job whose `job.json` carries the
+bridge's stall-watchdog block additionally carries `watchdog` = `{state,
+wd_view, suspicion_age_s, attempts, diagnosis_summary, last_action_at,
+recovered_at, needs_attention_at}`. `state` is the watchdog's own state and
+`wd_view` is the row colour the reader applies:
+
+| `wd_view` | watchdog `state` | row |
+|---|---|---|
+| `null` | `healthy`, `recovered` (or no block) | **blue** — Pi is working, or the watchdog just brought it back |
+| `"checking"` | `suspected_stall`, `diagnosing` | **amber, pulsing** (1.6 s) — the bridge suspects a stall and is silently checking; Pi may well be fine |
+| `"recovering"` | `recovering` | **orange** — the watchdog is terminating the stuck work |
+| `"attention"` | `needs_attention` | **red** — it gave up, a human is needed (and, like a failure, never time-quieted while the job is still active) |
+
+Strictly additive: `view`/`group` never move, the key appears only when
+`job.json` really holds a watchdog dict (a malformed or partial block is
+treated as absent — never a crash), it is emitted for `queued`/`running` jobs
+only, and an older reader ignores it. `diagnosis_summary` is capped at 300
+chars and path-redacted exactly like `error`; a `last_action` cmdline (pids,
+`ssh …`) never leaves the box — only the timestamp of the action is published.
+The badge itself stays a counter (blue/blinking while anything runs); the
+watchdog colour is per **row** in the card.
+
 ## Architecture
 
 ```
@@ -95,6 +117,14 @@ silent-but-healthy turn can show a false "stalled" (alarm clears as soon as
 any job file updates). Threshold: `PI_LAMP_STALL_S` (default 420 s).
 "runner vanished while status=running" maps to **interrupted** (red) without
 waiting for the bridge's lazy reconcile.
+
+Since writer 1.4 this local heuristic is no longer the whole story: the bridge
+runs its own stall watchdog (`pi-bridge watchdog tick`, every minute) which
+checks descendant processes and CPU deltas and records its verdict in
+`job.json`'s additive `watchdog` block. The lamp mirrors it per active job
+(see **Writer 1.4** above), so a job the watchdog is *silently checking* pulses
+amber, one it is recovering turns orange, and one it has given up on goes red —
+while a job it recovered is blue again.
 
 ### PI WEB deep link
 
@@ -157,9 +187,9 @@ default that would silently drop co-tenant extensions.
 ## Tests
 
 ```bash
-/home/hermes/.hermes/hermes-agent/venv/bin/python -m pytest tests -q   # 69 passed (one skips without node)
-node tests/js/smoke.js assets/pi-lamp.js                              # 88 passed
-node tests/js/smoke.js assets/pi-lamp.js /path/to/status.json          # 112 passed on live data (+ reader-vs-writer; the real-snapshot count follows the snapshot)
+/home/hermes/.hermes/hermes-agent/venv/bin/python -m pytest tests -q   # 88 passed (one skips without node)
+node tests/js/smoke.js assets/pi-lamp.js                              # 150 passed
+node tests/js/smoke.js assets/pi-lamp.js /path/to/status.json          # + the real-snapshot checks (the count follows the snapshot)
 ```
 
 `test_writer.py` covers running/stalled/interrupted/done/failed views, the
@@ -175,6 +205,14 @@ runner), done→quiet after 3 h (configurable), failures never quiet, aged
 beyond the day window, active-first ordering, and that every writer-1.0 key is
 still present.
 
+`test_writer.py` additionally covers the 1.4 watchdog block: every state maps
+to the right `wd_view`, an absent/empty/corrupt block (`"watchdog": "garbage"`,
+a list, a JSON null) means no `watchdog` key and no crash, an unknown state or
+junk field types degrade to `healthy`/`null` instead of a guess, a finished job
+never carries the block, the diagnosis summary is capped at 300 chars and
+path-free, no `last_action` cmdline ever reaches `status.json`, and ranking and
+`view` are untouched.
+
 `tests/js/smoke.js` drives a fake DOM through: counters (one vs several
 running jobs on one chat), every running job reachable in the card, collapsed
 problem/finished sections, quiet jobs counted but not listed, running→finished
@@ -188,7 +226,10 @@ own jobs run out clears the badge in ONE click instead of re-lighting it via
 the wildcard fall-through (a running own job keeps the fallback hidden and
 then the wildcard is left for the other chats), that an
 acknowledgement survives reloading the tab (a second instance over the same
-storage), stale/skew/transport failures, and exactly-balanced listeners. Given a
+storage), the 1.4 watchdog row colours and labels (checking / recovering /
+NEEDS ATTENTION / recovered-blue, the silent duration kept, and every malformed
+block rendering as an ordinary blue row), stale/skew/transport failures, and
+exactly-balanced listeners. Given a
 status.json path it also re-derives every badge (number *and* colour) from the
 raw snapshot and asserts the reader agrees with the writer — that last phase is
 what `tests/test_reader_vs_writer_js.py` runs.

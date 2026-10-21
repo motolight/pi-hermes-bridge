@@ -77,6 +77,8 @@ STATUS_KEYS_V1 = {
 ADDED_V1_2 = {"wake"}
 ADDED_V1_3 = {"origin"}
 ADDED_V1_4 = {"delivery"}
+# v0.5.0 adds the stall-watchdog view to the status shape.
+ADDED_V0_5 = {"watchdog"}
 
 
 def test_piweb_unavailable_leaves_job_behaviour_identical(env, workdir):
@@ -94,14 +96,14 @@ def test_piweb_unavailable_leaves_job_behaviour_identical(env, workdir):
     # identical shape: pi_web + wake are the only additions over the V1 view
     assert set(v_live) == set(v_off) == (
         STATUS_KEYS_V1 | {"pi_web"} | ADDED_V1_2 | ADDED_V1_3
-        | ADDED_V1_4)
+        | ADDED_V1_4 | ADDED_V0_5)
 
     f_live = wait_terminal(v_live["job_id"], extra_env=live_env)
     assert f_live["status"] == "completed"
     assert f_live["final_result"].startswith("FAKEOK")
     assert set(f_live) == (
         STATUS_KEYS_V1 | {"pi_web"} | ADDED_V1_2 | ADDED_V1_3
-        | ADDED_V1_4)
+        | ADDED_V1_4 | ADDED_V0_5)
 
     # the very same job read with observability switched off must produce a
     # byte-identical view apart from pi_web -- compared only after the job

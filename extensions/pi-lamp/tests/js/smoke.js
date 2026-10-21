@@ -390,6 +390,89 @@ async function run_() {
   }
   await set([]);
 
+  /* ── stall watchdog (writer 1.4 `watchdog`): row colour + label ───── */
+  /* The bridge's stall watchdog publishes wd_view per ACTIVE job; the row
+   * colour contract is checking = amber pulse, recovering = orange,
+   * attention = red, recovered/healthy = blue.  The badge stays a counter. */
+  const WD = (stateName, wdViewName) => ({
+    watchdog: {
+      state: stateName, wd_view: wdViewName, suspicion_age_s: 420, attempts: 1,
+      diagnosis_summary: 'stale-descendant-zero-cpu; silence=900s src=session_jsonl',
+      last_action_at: isoAgo(60), recovered_at: null, needs_attention_at: null,
+    },
+  });
+  const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const [stateName, wv, label] of [
+    ['suspected_stall', 'checking', 'watchdog: checking'],
+    ['diagnosing', 'checking', 'watchdog: checking'],
+    ['recovering', 'recovering', 'watchdog: recovering'],
+    ['needs_attention', 'attention', 'watchdog: NEEDS ATTENTION'],
+  ]) {
+    await set([run('w1', WD(stateName, wv))]);
+    const cls0 = badge(rowA) ? badge(rowA).className : '(no badge)';
+    check('watchdog ' + stateName + ': badge stays a live counter',
+          /pilamp--live/.test(cls0) && badge(rowA).textContent === 'Pi: 1',
+          cls0 + ' ' + badge(rowA).textContent);
+    await open();
+    check('watchdog ' + stateName + ': the row takes the wd-' + wv + ' colour',
+          items('--wd-' + wv).length === 1 && items('--running').length === 1,
+          items().map((i) => i.className).join('|'));
+    check('watchdog ' + stateName + ': the row label says "' + label + '"',
+          new RegExp(reEsc(label)).test(cardText()), cardText());
+    check('watchdog ' + stateName + ': the diagnosis is reported under the row',
+          /watchdog \u00b7 suspected 7m 0s \u00b7 attempt 1 \u00b7 stale-descendant-zero-cpu/.test(cardText()),
+          cardText());
+    doc.querySelector('.pilamp-card-x').fire('click');
+  }
+  // a needs-attention job is never hidden by time while it is still active
+  await set([run('w5', WD('needs_attention', 'attention'))]);
+  await open();
+  check('watchdog attention: listed in the running section, not quieted',
+        items('--wd-attention').length === 1 && /Running \u2014 1/.test(cardText()), cardText());
+  doc.querySelector('.pilamp-card-x').fire('click');
+
+  // a successful recovery renders blue again, with a transient label
+  await set([run('w2', WD('recovered', null))]);
+  check('watchdog recovered: badge stays a live counter',
+        badge(rowA) && /pilamp--live/.test(badge(rowA).className), badge(rowA) && badge(rowA).className);
+  await open();
+  check('watchdog recovered: the row is blue again (no amber, no red)',
+        items('--wd-recovered').length === 1 && items('--wd-checking').length === 0
+        && items('--wd-attention').length === 0,
+        items().map((i) => i.className).join('|'));
+  check('watchdog recovered: the row says recovered',
+        /watchdog: recovered/.test(cardText()), cardText());
+  doc.querySelector('.pilamp-card-x').fire('click');
+
+  // a silent job the watchdog is checking keeps its existing "silent …" info
+  await set([run('w3', Object.assign({ view: 'stalled', activity_age_s: 900 },
+                                     WD('suspected_stall', 'checking')))]);
+  await open();
+  check('watchdog checking on a silent job keeps the silent duration',
+        items('--wd-checking').length === 1 && /silent 15m 0s/.test(cardText())
+        && /watchdog: checking/.test(cardText()), cardText());
+  doc.querySelector('.pilamp-card-x').fire('click');
+
+  // nothing there, or something malformed: exactly the old blue row, no crash
+  for (const [name, bad] of [['no block', {}],
+                             ['watchdog null', { watchdog: null }],
+                             ['watchdog a string', { watchdog: 'checking' }],
+                             ['wd_view unknown', { watchdog: { state: 'suspected_stall', wd_view: 'maybe' } }],
+                             ['wd_view a prototype key', { watchdog: { wd_view: 'toString' } }],
+                             ['no state and no wd_view', { watchdog: { attempts: 3 } }]]) {
+    await set([run('w4', bad)]);
+    const cls1 = badge(rowA) ? badge(rowA).className : '(no badge)';
+    check('malformed watchdog (' + name + '): live badge unchanged',
+          /pilamp--live/.test(cls1) && badge(rowA).textContent === 'Pi: 1', cls1);
+    await open();
+    const rowCls = items().map((i) => i.className).join('|');
+    check('malformed watchdog (' + name + '): no watchdog colour invented',
+          !/--wd-/.test(rowCls) && items('--running').length === 1
+          && !/watchdog/.test(cardText()), rowCls);
+    doc.querySelector('.pilamp-card-x').fire('click');
+  }
+  await set([]);
+
   /* ── back-compat: a writer-1.0 snapshot has no group / finished_at ───── */
   await set([v1Job('o1', 'done', 3600)]);
   check('v1 snapshot: done 1h ago still listed', badge(rowA).textContent === 'Pi: 1'
@@ -676,6 +759,21 @@ async function run_() {
             body.querySelectorAll('.pilamp-card .pilamp-item--awaiting').length === wantAwaiting,
             String(body.querySelectorAll('.pilamp-card .pilamp-item--awaiting').length)
             + ' want ' + wantAwaiting);
+      // Stall watchdog (writer >= 1.4): an ACTIVE job that carries a watchdog
+      // view must be listed in exactly that colour, and a job the watchdog
+      // brought back must be blue again.
+      for (const wv of ['checking', 'recovering', 'attention']) {
+        const wantWd = mine.filter((j) => isActive(j) && j.watchdog
+          && j.watchdog.wd_view === wv).length;
+        const gotWd = body.querySelectorAll('.pilamp-card .pilamp-item--wd-' + wv).length;
+        check('real snapshot: ' + wantWd + ' running row(s) in the watchdog colour ' + wv,
+              gotWd === wantWd, String(gotWd) + ' want ' + wantWd);
+      }
+      const wantRec = mine.filter((j) => isActive(j) && j.watchdog
+        && !j.watchdog.wd_view && j.watchdog.state === 'recovered').length;
+      const gotRec = body.querySelectorAll('.pilamp-card .pilamp-item--wd-recovered').length;
+      check('real snapshot: ' + wantRec + ' recovered watchdog row(s) render blue',
+            gotRec === wantRec, String(gotRec) + ' want ' + wantRec);
       if (mine.some((j) => j.group === 'quiet')) {
         check('real snapshot: a quiet job is explained in the card', /older than/.test(cardText()), cardText());
       }

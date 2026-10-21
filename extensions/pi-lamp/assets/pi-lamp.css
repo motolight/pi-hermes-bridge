@@ -184,6 +184,36 @@
 .pilamp-item--awaiting       { border-left-color: #f5a623; }
 .pilamp-item--deliveryfailed { border-left-color: #e74c3c; }
 
+/* Stall watchdog (writer >= 1.4): the per-job colour contract, applied on top
+   of --running/--stalled (declared later, so the same-specificity rule wins).
+   blue = working or freshly recovered, amber pulse = the watchdog is silently
+   checking, orange = recovering, red = it gave up and needs a human. */
+.pilamp-item--wd-checking {
+  border-left-color: #f5a623;
+  animation: pilamp-wd-pulse 1.6s ease-in-out infinite;
+}
+.pilamp-item--wd-recovering { border-left-color: #e07b39; }
+.pilamp-item--wd-attention {
+  border-left-color: #e74c3c;
+  background: rgba(231, 76, 60, 0.14);
+}
+.pilamp-item--wd-recovered  { border-left-color: #3889fd; }
+
+@keyframes pilamp-wd-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pilamp-item--wd-checking { animation: none; }
+}
+
+.pilamp-wd { font-weight: 600; }
+.pilamp-wd--checking   { color: #f5a623; }
+.pilamp-wd--recovering { color: #e07b39; }
+.pilamp-wd--attention  { color: #ff6f61; }
+.pilamp-wd--recovered  { color: #6fb0ff; opacity: 0.85; }
+.pilamp-wd-detail      { opacity: 0.8; color: #cfd4dc; }
+
 .pilamp-item-main {
   display: flex;
   align-items: center;

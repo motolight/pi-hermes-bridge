@@ -8,7 +8,9 @@ PI_BRIDGE_HOME byte-for-byte unchanged, and that PI WEB links are opt-in and
 restricted to private addresses.  Also covers the 1.1 UI fields: finished_at
 from the last turn (falling back to updated_at) and the active / recent /
 quiet / aged grouping that decides what the badge counts and what the card
-lists.  PI_LAMP_PIWEB=0 keeps the view tests free of
+lists, the 1.3 `hermes` delivery honesty field, and the 1.4 additive
+`watchdog` field (state -> wd_view colour contract, absent/corrupt blocks
+ignored, diagnosis capped and path-free).  PI_LAMP_PIWEB=0 keeps the view tests free of
 any pi-web dependency.  Nothing here touches the real bridge state.
 """
 import json
@@ -29,7 +31,7 @@ _python3 = _sp.run(["which", "python3.12"], capture_output=True, text=True).stdo
 def make_job(root: Path, job_id: str, *, status="running", origin=None,
              created="-300", updated="-30", turns=None, delivery=None,
              last_run=None, error=None, task="SECRET task text", cwd="/secret/cwd",
-             final_result_chars=0):
+             final_result_chars=0, watchdog=None):
     d = root / "jobs" / job_id
     d.mkdir(parents=True)
     job = {
@@ -52,6 +54,9 @@ def make_job(root: Path, job_id: str, *, status="running", origin=None,
         "final_result_chars": final_result_chars,
         "error": error,
     }
+    if watchdog is not None:
+        # additive v0.5.0 block; None means the job has no watchdog block at all
+        job["watchdog"] = watchdog
     (d / "job.json").write_text(json.dumps(job))
     tdir = d / "turns"
     tdir.mkdir(exist_ok=True)
@@ -673,7 +678,7 @@ def _completed(delivery=None, *, off=-5 * 3600, **kw):
 
 
 def test_version_is_bumped_for_delivery_honesty():
-    assert _writer_mod().VERSION == "1.3.0"
+    assert tuple(int(x) for x in _writer_mod().VERSION.split(".")) >= (1, 3, 0)
 
 
 def test_hermes_delivery_state_truth_table():
@@ -836,3 +841,195 @@ def test_abandoned_delivery_sorts_with_the_failures(tmp_path):
     make_job(root, JOB_C, **_completed("native-delivery-exhausted", off=-4000))  # red
     data = run_writer(tmp_path, root)
     assert [j["job_id"] for j in data["jobs"]] == [JOB_C, JOB_OK, JOB_B]
+
+
+# ────────────────────── stall watchdog: the bridge watches the job (1.4) ───
+#
+# The bridge's stall watchdog keeps its findings in an additive `watchdog`
+# block inside job.json.  For an ACTIVE job the writer mirrors a compact,
+# privacy-safe view of it under `watchdog`, whose `wd_view` is the browser's
+# colour contract:
+#
+#   suspected_stall / diagnosing -> "checking"    (amber pulse)
+#   recovering                   -> "recovering"  (orange)
+#   needs_attention              -> "attention"   (red)
+#   healthy / recovered / absent -> null          (blue)
+#
+# It is strictly additive: `view` and `group` never move, a job without a
+# usable block carries no `watchdog` key at all, and a corrupt block is
+# exactly as silent as a missing one.
+
+WD_EXPECT_KEYS = {"state", "wd_view", "suspicion_age_s", "attempts",
+                  "diagnosis_summary", "last_action_at", "recovered_at",
+                  "needs_attention_at"}
+
+
+def _wd(state="suspected_stall", **over):
+    """A watchdog block in the shape pi_bridge.watchdog writes into job.json."""
+    block = {"state": state, "updated_at": _iso(time.time()),
+             "last_activity_at": _iso(time.time() - 900),
+             "suspicion_age_s": 420.0, "suspected_since": _iso(time.time() - 420),
+             "snoozed_until": None,
+             "diagnosis": {"summary": "stale-descendant-zero-cpu; silence=900s src=session_jsonl",
+                           "reasons": ["stale-descendant-zero-cpu"],
+                           "at": _iso(time.time())},
+             "confirm_repeat": 0, "attempts": 1,
+             "last_action": {"at": _iso(time.time() - 60),
+                             "trigger": "watchdog:confirmed-stall", "ok": True,
+                             "terminated": [{"pid": 4242,
+                                             "cmdline": "bash -c ssh secret-host tail -f /home/hermes/secret.log"}],
+                             "killed": []},
+             "recovered_at": None, "needs_attention_at": None,
+             "recover_baseline_ts": 1234.5, "recover_deadline_ts": 1299.5,
+             "tier2_strikes": 0}
+    block.update(over)
+    return block
+
+
+def test_version_is_bumped_for_the_watchdog():
+    assert _writer_mod().VERSION == "1.4.0"
+
+
+def test_watchdog_block_maps_to_wd_view(tmp_path):
+    """One active job per watchdog state; every state maps to the colour the
+    browser contract requires, and the block's own fields ride along."""
+    root = tmp_path / "bridge"
+    expect = {"healthy": None, "suspected_stall": "checking", "diagnosing": "checking",
+              "recovering": "recovering", "recovered": None,
+              "needs_attention": "attention"}
+    ids = [JOB_OK, JOB_B, JOB_C, JOB_D, JOB_E, "pb-20260101T000005Z-ffffff"]
+    assert len(expect) == len(ids)
+    for job_id, (state, _want) in zip(ids, sorted(expect.items())):
+        make_job(root, job_id, watchdog=_wd(state))
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert len(jobs) == len(expect)
+    for jid, j in jobs.items():
+        assert set(j["watchdog"]) == WD_EXPECT_KEYS
+        assert j["view"] == "running" and j["group"] == "active"   # untouched
+    by_state = {j["watchdog"]["state"]: j for j in jobs.values()}
+    for state, want in expect.items():
+        w = by_state[state]["watchdog"]
+        assert w["wd_view"] == want, (state, w)
+    # the interesting fields survive the copy
+    w = by_state["suspected_stall"]["watchdog"]
+    assert w["suspicion_age_s"] == 420.0 and w["attempts"] == 1
+    assert w["diagnosis_summary"].startswith("stale-descendant-zero-cpu")
+    assert w["last_action_at"] and w["recovered_at"] is None
+    w = by_state["recovered"]["watchdog"]
+    assert w["state"] == "recovered" and w["wd_view"] is None      # blue again
+
+
+def test_watchdog_absent_means_no_key(tmp_path):
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK)
+    make_job(root, JOB_B, watchdog={})          # an empty block is still a block
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert "watchdog" not in jobs[JOB_OK]
+    assert jobs[JOB_B]["watchdog"]["wd_view"] is None              # empty = healthy
+
+
+def test_watchdog_corrupt_block_is_silent_not_fatal(tmp_path):
+    """A hand-edited or half-written block must behave exactly like no block:
+    no `watchdog` key, no crash, the view unchanged."""
+    root = tmp_path / "bridge"
+    bad = ["garbage", 42, [1, 2, 3], None, True]
+    ids = [JOB_OK, JOB_B, JOB_C, JOB_D, JOB_E]
+    for job_id, raw in zip(ids, bad):
+        make_job(root, job_id, watchdog=raw if raw is not None else "x")
+    # None above became "x"; also cover a real JSON null via a rewrite
+    d = root / "jobs" / JOB_E
+    job = json.loads((d / "job.json").read_text())
+    job["watchdog"] = None
+    (d / "job.json").write_text(json.dumps(job))
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert len(jobs) == len(ids)
+    for jid in ids:
+        assert "watchdog" not in jobs[jid], jid
+        assert jobs[jid]["view"] == "running" and jobs[jid]["group"] == "active"
+
+
+def test_watchdog_invalid_fields_degrade_to_healthy(tmp_path):
+    """Unknown state, junk numbers, a diagnosis of the wrong shape: never a
+    guess, never a crash — the row stays blue."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, watchdog=_wd("exploded",
+                                        attempts="many",
+                                        suspicion_age_s="soon",
+                                        diagnosis=["not", "a", "dict"],
+                                        last_action="nope",
+                                        recovered_at=17,
+                                        needs_attention_at=["x"]))
+    w = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}[JOB_OK]["watchdog"]
+    assert w == {"state": "healthy", "wd_view": None, "suspicion_age_s": None,
+                 "attempts": 0, "diagnosis_summary": None, "last_action_at": None,
+                 "recovered_at": None, "needs_attention_at": None}
+
+
+def test_watchdog_view_pure_helper():
+    m = _writer_mod()
+    assert m.watchdog_view({}) is None
+    assert m.watchdog_view({"watchdog": "garbage"}) is None
+    assert m.watchdog_view(None) is None
+    assert m.watchdog_view("nope") is None
+    w = m.watchdog_view({"watchdog": {"state": "recovering"}})   # partial block
+    assert w["state"] == "recovering" and w["wd_view"] == "recovering"
+    assert w["attempts"] == 0 and w["diagnosis_summary"] is None
+    # a summary of the wrong type is not stringified into status.json
+    assert m.watchdog_view({"watchdog": {"state": "diagnosing",
+                                         "diagnosis": {"summary": {"a": 1}}}})["diagnosis_summary"] is None
+    assert m.watchdog_view({"watchdog": {"state": "diagnosing",
+                                         "diagnosis": {"summary": "   "}}})["diagnosis_summary"] is None
+
+
+def test_watchdog_only_for_active_jobs(tmp_path):
+    """The watchdog only speaks about jobs the bridge still considers active;
+    a finished job keeps the block in job.json but the lamp ignores it (and an
+    interrupted-but-still-running job is reported, because the bridge has)."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, status="completed", updated=str(-3600),
+             turns=_turns(finished_off=-3600), watchdog=_wd("needs_attention"))
+    make_job(root, JOB_B, watchdog=_wd("needs_attention"))       # active, alive
+    jobs = {j["job_id"]: j for j in run_writer(tmp_path, root)["jobs"]}
+    assert "watchdog" not in jobs[JOB_OK]
+    assert jobs[JOB_B]["watchdog"]["wd_view"] == "attention"
+
+
+def test_watchdog_text_is_capped_and_path_free(tmp_path):
+    """status.json is served over HTTP: a diagnosis summary is capped at 300
+    chars and carries no local paths, and a last_action cmdline never leaves
+    the box at all."""
+    root = tmp_path / "bridge"
+    long_summary = ("/home/hermes/secret-dir/secret.log stalled; " + "x" * 500)
+    make_job(root, JOB_OK, watchdog=_wd("suspected_stall",
+                                        diagnosis={"summary": long_summary,
+                                                   "reasons": ["x"],
+                                                   "at": _iso(time.time())}))
+    data = run_writer(tmp_path, root)
+    w = {j["job_id"]: j for j in data["jobs"]}[JOB_OK]["watchdog"]
+    assert len(w["diagnosis_summary"]) <= 300
+    assert "/home" not in w["diagnosis_summary"] and "secret.log" not in w["diagnosis_summary"]
+    assert not re.search(r"<p(?:a(?:t(?:h)?)?)?$", w["diagnosis_summary"]), w["diagnosis_summary"]
+    raw = json.dumps(data)
+    for secret in ("secret-host", "secret.log", "/home/hermes", "ssh secret"):
+        assert secret not in raw, secret
+
+
+def test_watchdog_does_not_change_ranking_or_other_jobs(tmp_path):
+    """A watchdog-attended running job sorts exactly where the same running
+    job without one does; the rest of the snapshot is untouched."""
+    root = tmp_path / "bridge"
+    make_job(root, JOB_OK, watchdog=_wd("diagnosing"))
+    make_job(root, JOB_B, status="failed", updated=str(-7200), error="boom",
+             turns=_turns(finished_off=-7200, exit_code=1))
+    make_job(root, JOB_C, status="completed", updated=str(-3600),
+             turns=_turns(finished_off=-3600))
+    plain = run_writer(tmp_path, root)["jobs"]
+    ids = [j["job_id"] for j in plain]
+    assert ids == [JOB_OK, JOB_B, JOB_C]
+    # same order with the block removed
+    d = root / "jobs" / JOB_OK
+    job = json.loads((d / "job.json").read_text())
+    job.pop("watchdog")
+    (d / "job.json").write_text(json.dumps(job))
+    assert [j["job_id"] for j in run_writer(tmp_path, root)["jobs"]] == ids
+

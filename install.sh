@@ -226,11 +226,11 @@ mkdir -p "$HOME/.hermes/plugins/pi-worker"
 cp -R plugin/. "$HOME/.hermes/plugins/pi-worker/"
 rm -rf "$HOME/.hermes/plugins/pi-worker/__pycache__"
 printf 'Plugin copied to ~/.hermes/plugins/pi-worker.\n'
-for t in pi_delegate pi_status pi_feedback pi_cancel pi_list; do
+for t in pi_delegate pi_status pi_feedback pi_cancel pi_list pi_recover; do
   grep -q "  - $t" "$HOME/.hermes/plugins/pi-worker/plugin.yaml" \
     || die "plugin manifest at $HOME/.hermes/plugins/pi-worker is missing tool $t"
 done
-printf 'Manifest provides all 5 tools: pi_delegate pi_status pi_feedback pi_cancel pi_list\n'
+printf 'Manifest provides all 6 tools: pi_delegate pi_status pi_feedback pi_cancel pi_list pi_recover\n'
 hermes plugins enable pi-worker >/dev/null 2>&1 \
   || warn "'hermes plugins enable pi-worker' returned an error; enable manually: hermes plugins enable pi-worker"
 "$BRIDGE_PY" - <<'PY'
@@ -250,7 +250,7 @@ SKILL_ACTION=$(printf '%s' "$SKILL_RES" | jget skill)
 printf 'pi-routing-policy skill: %s\n' "$SKILL_ACTION"
 case "$SKILL_ACTION" in created|updated) CHANGED=1 ;; esac
 # ---------------------------------------------------------------------------
-say "7/8 completion wake channel (webhook route + wake.json)"
+say "7/8 completion wake + stall-watchdog channels (webhook routes + wake.json)"
 WAKE_BROKEN=0
 ROUTE_RES=$(hs route-install --port "$WAKE_PORT" --json \
              ${NON_LOOPBACK:+--allow-non-loopback-webhook}) \
@@ -299,6 +299,30 @@ PY
       die "existing ${PI_BRIDGE_HOME:-$HOME/.local/state/pi-bridge}/wake.json was not created by this installer AND does not match the configured route (problem: $VERIFY) — wakes would silently fail. Nothing further was changed: review that file (or delete it) and re-run ./install.sh to let the installer manage the wake channel. Earlier steps of this run remain installed; ./uninstall.sh removes them."
     fi
   fi
+fi
+
+# --- stall route (v0.5.0): separate event type + policy on the same platform.
+# Best-effort by design: a manual/foreign wake setup must never make the
+# whole install fail; the completion channel stays the hard requirement.
+STALL_ACTION=""
+if STALL_RES=$(hs stall-route-install ${NON_LOOPBACK:+--allow-non-loopback-webhook} --json); then
+  STALL_ACTION=$(printf '%s' "$STALL_RES" | jget route)
+  printf 'webhook route pi-bridge-stall: %s (separate stall-event policy; completion route untouched)\n' "$STALL_ACTION"
+  case "$STALL_ACTION" in created_route|updated_route) CHANGED=1 ;; esac
+  if [ "$STALL_ACTION" = "kept_manual" ]; then
+    printf 'NOTE: a pre-existing manual pi-bridge-stall route was found and LEFT UNTOUCHED.\n'
+  fi
+else
+  warn "stall route pi-bridge-stall was NOT added (stall wake events disabled; everything else installs): $STALL_RES"
+fi
+
+# --- stall watchdog units (v0.5.0): systemd user timer + oneshot service
+if [ "$HAVE_SYSTEMD" = 1 ]; then
+  WD_RES=$(hs watchdog-install) || die "could not install the watchdog systemd units: $WD_RES"
+  WD_ACTION=$(printf '%s' "$WD_RES" | jget watchdog_units)
+  printf 'stall watchdog units: %s (pi-bridge-watchdog.timer runs `pi-bridge watchdog tick` every minute)\n' "$WD_ACTION"
+else
+  printf 'NOTE: no systemd user session — stall watchdog NOT installed as a timer; run it manually with: pi-bridge watchdog tick (jobs still complete normally).\n'
 fi
 
 # ---------------------------------------------------------------------------
@@ -364,6 +388,7 @@ Summary:
   * bridge CLI + pi-worker plugin: installed, plugin enabled
   * routing policy: SOUL.md managed block ($(printf '%s' "$SOUL_RES" | jget soul)), skill $(printf '%s' "$SKILL_RES" | jget skill)
   * completion wake: route '$ROUTE_ACTION' on 127.0.0.1:$WAKE_PORT, wake.json $(printf '%s' "$WAKE_RES" | jget wake_json)
+  * stall watchdog: stall route '$STALL_ACTION', units ${WD_ACTION:-not-installed}
   * gateway: $GATEWAY_NOTE
 EOF
 if [ "$ORCH_PROBE" = 1 ] && [ "${WAKE_BROKEN:-0}" != 1 ]; then

@@ -55,6 +55,21 @@ if [ -n "$BRIDGE_PY" ]; then
     *)             printf 'ERROR: could not disable/remove wake.json; check ${PI_BRIDGE_HOME:-~/.local/state/pi-bridge}/wake.json manually.\n'
                    FAILED=1 ;;
   esac
+  # v0.5.0: stall route + watchdog units (bridge-owned only; job history kept)
+  R=$(hs stall-route-remove --json || true)
+  case "$(printf '%s' "$R" | jget route)" in
+    removed)       printf 'webhook route pi-bridge-stall: removed (other routes untouched)\n' ;;
+    kept_foreign)  printf 'webhook route pi-bridge-stall: NOT ours — left untouched\n' ;;
+    absent)        printf 'webhook route pi-bridge-stall: not present\n' ;;
+    *)             printf 'ERROR: could not evaluate/remove the stall route; check ~/.hermes/config.yaml manually.\n'
+                   FAILED=1 ;;
+  esac
+  R=$(hs watchdog-remove || true)
+  case "$(printf '%s' "$R" | jget watchdog_units)" in
+    removed)   printf 'stall watchdog units + watchdog state: removed (job history kept)\n' ;;
+    not_owned) printf 'stall watchdog units: not owned by the installer — left alone\n' ;;
+    *)         printf 'NOTE: could not evaluate the watchdog units; check ~/.config/systemd/user/pi-bridge-watchdog.{service,timer} manually.\n' ;;
+  esac
   if [ "$HAS_STATE" != 1 ]; then
     printf 'NOTE: no installer ownership state found under \${PI_BRIDGE_HOME:-~/.local/state/pi-bridge}.\n'
     printf '      If you installed with PI_BRIDGE_HOME set elsewhere, re-run: PI_BRIDGE_HOME=<that path> ./uninstall.sh\n'

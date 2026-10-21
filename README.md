@@ -61,7 +61,7 @@ User ──▶ Hermes ──▶ pi_delegate ──▶ bridge runner (systemd, du
 ## What it is / is not
 
 * **Is:** a small Python runner + CLI (`pi-bridge`), a Hermes user plugin
-  (`pi-worker`, 5 tools), durable job state under `~/.local/state/pi-bridge/`,
+  (`pi-worker`, 6 tools), durable job state under `~/.local/state/pi-bridge/`,
   an optional self-waking webhook, and an optional read-only PI WEB observability
   view.
 * **Is not:** a replacement for either agent. It never touches Hermes core, Pi,
@@ -108,7 +108,7 @@ normal path.** Concretely, `install.sh`:
    never picking subagents (that is the Pi orchestrator's own decision).
 3. **Installs the bridge** — a venv in the checkout, the `pi-bridge` CLI
    linked at `~/.local/bin/pi-bridge`, the `pi-worker` Hermes plugin
-   installed + enabled (5 tools), with one controlled
+   installed + enabled (6 tools), with one controlled
    `hermes gateway restart` at the end so everything is live immediately.
 4. **Installs the routing policy** — a short always-on managed block in
    `~/.hermes/SOUL.md` between `<!-- pi-hermes-bridge:begin/end -->` markers
@@ -138,6 +138,7 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
 | `pi_feedback` | continue the **same** Pi session with review notes |
 | `pi_cancel` | safely stop a running job (bridge-created jobs only) |
 | `pi_list` | recent jobs (id/status/cwd/task preview) — lost-context recovery |
+| `pi_recover` | tier-1 stall recovery for ONE job: interrupts only that job's verified descendant tool commands (never Pi, never arbitrary PIDs) |
 
 ## Features
 
@@ -176,6 +177,17 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   and the `pi_web` field report whether the job's Pi session is visible in PI
   WEB, with a deep link; when PI WEB is down the bridge behaves exactly as
   before.
+* **Autonomous stall watchdog (v0.5.0)** — a bridge-owned systemd user timer
+  runs `pi-bridge watchdog tick` every minute: a running job that goes silent
+  is SUSPECTED, then diagnosed with multiple independent read-only signals
+  (identity-verified Pi PID, stale session JSONL/stdout, zero-CPU descendant
+  tool commands across repeated /proc samples, optional vLLM `/metrics`
+  corroboration), and tier-1-recovered automatically — only the job's verified
+  descendant tool commands are interrupted, never Pi itself, so the session
+  resumes in place. Bounded (≤2 attempts), then `needs_attention` with a user
+  message plus a `pi_bridge_stall` event to Hermes on a separate route/policy.
+  Server-side by design: independent of any browser, WebUI or pi-lamp
+  connection. See [`docs/STALL_WATCHDOG.md`](docs/STALL_WATCHDOG.md).
 * **Safety** — no `shell=True`, task via stdin, argv only, generated job ids,
   bounded outputs, structured errors, secrets never stored in job state.
 * **Live WebUI status badges (optional, `extensions/pi-lamp/`)** — a

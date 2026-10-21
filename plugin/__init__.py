@@ -1,4 +1,4 @@
-"""pi-worker: Hermes user plugin exposing the durable pi-bridge as 5 tools.
+"""pi-worker: Hermes user plugin exposing the durable pi-bridge as 6 tools.
 
 Thin adapter only: every tool shells out (argv, no shell) to the standalone
 `pi-bridge` CLI. The plugin never talks to pi directly and never selects Pi
@@ -214,6 +214,15 @@ def pi_cancel(args: dict, **kwargs) -> str:
     return _run(["cancel", job_id, "--json"])
 
 
+def pi_recover(args: dict, **kwargs) -> str:
+    job_id = args.get("job_id") or ""
+    if not job_id:
+        return json.dumps({"error": "job_id is required"})
+    # Tier-1 stall recovery: the CLI verifies PID identity + ancestry of the
+    # job's own descendant tool commands before signalling anything.
+    return _run(["recover", job_id, "--json"], timeout=_SUBMIT_TIMEOUT)
+
+
 _SCHEMAS = {
     "pi_delegate": {
         "name": "pi_delegate",
@@ -317,6 +326,27 @@ _SCHEMAS = {
             "required": ["job_id"],
         },
     },
+    "pi_recover": {
+        "name": "pi_recover",
+        "description": (
+            "Tier-1 stall recovery for ONE bridge job (v0.5.0): interrupts "
+            "ONLY the verified descendant tool commands of that job's Pi "
+            "process (SIGTERM, then SIGKILL of survivors) so a hung "
+            "foreground command returns an error and Pi continues reasoning "
+            "in the SAME session. The Pi process and the runner are never "
+            "killed; arbitrary PIDs or commands cannot be passed. Accepts a "
+            "job_id only. Use it only when pi_status shows the watchdog "
+            "state needs_attention; the watchdog itself already performs "
+            "bounded automatic attempts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job id from pi_delegate"},
+            },
+            "required": ["job_id"],
+        },
+    },
 }
 
 _HANDLERS = {
@@ -325,6 +355,7 @@ _HANDLERS = {
     "pi_status": pi_status,
     "pi_feedback": pi_feedback,
     "pi_cancel": pi_cancel,
+    "pi_recover": pi_recover,
 }
 
 
@@ -349,7 +380,7 @@ _HANDLERS = {
 # two implementations against shared fixtures.
 _WEBUI_POLL_SECONDS = 3.0
 _WEBUI_INFLIGHT_STALE_S = 120.0
-_PLUGIN_VERSION = "0.4.2"    # keep in sync with pyproject.toml project.version
+_PLUGIN_VERSION = "0.5.0"    # keep in sync with pyproject.toml project.version
 _WEBUI_PROTOCOL = "V1.5"
 _DEFAULT_MAX_ATTEMPTS = 1200   # ~1 h at the 3 s tick
 

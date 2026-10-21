@@ -5,6 +5,54 @@ the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
 the `V1.x` labels in the prose and in `docs/` name the bridge protocol
 revision, which is tracked independently of the package version.
 
+## 0.5.0 — 2026-10-21 (protocol V1.5, unchanged — fully backward-compatible)
+
+* **Autonomous stall watchdog.** A bridge-owned systemd user timer runs
+  `pi-bridge watchdog tick` every minute: running jobs silent past
+  `stall_after_s` (default 15 min) are SUSPECTED, then diagnosed with
+  multiple independent read-only signals (job running, runner alive,
+  Pi PID identity-verified, stale session JSONL/stdout/runner log,
+  descendant tool-command CPU ~0 across repeated /proc samples, optional
+  vLLM `/metrics` backend-idle corroboration). A long build/test with CPU
+  activity or periodic output is never a stall. The watchdog state lives
+  in the additive `job["watchdog"]` block — `job.status` and the v0.4.2
+  completion pipeline are never touched, and terminal jobs are out of
+  scope. See `docs/STALL_WATCHDOG.md`.
+* **Tier-1 auto-recovery only.** A confirmed stall interrupts ONLY the
+  verified descendant tool commands of that job (ancestry re-walked to the
+  identity-verified Pi PID, start-time re-checked at signal time, SIGTERM
+  with bounded grace, then SIGKILL of survivors of that subtree); Pi
+  itself is never killed, so the hung tool call errors out and Pi
+  continues in the SAME session; the resume is CONFIRMED from the
+  JSONL/turn activity advancing past a pre-signal baseline, never
+  assumed. Tier 2 (Pi/model call hung) is only diagnosed and reported.
+  At most 2 automatic attempts, then `needs_attention` + a user message
+  along the job's origin. Motivation: the 2026-10-21 production incident
+  `pb-20261021T191120Z-532dc0`
+  (`docs/INCIDENT_2026-10-21_PB-20261021T191120Z.md`).
+* **Stall events to Hermes on a separate channel policy.** New
+  bridge-owned webhook route `pi-bridge-stall` (same platform/secret as
+  the completion route, separate event type `pi_bridge_stall`, separate
+  prompt with a strictly bounded recovery path); deliveries are durable
+  spool + retry with a constant `X-Request-ID` per (job, turn, severity)
+  for the gateway idempotency cache — the same reliability contract as
+  the completion wake. The read-only acceptance wake is unchanged.
+* **`pi_recover` plugin tool / `pi-bridge recover`.** The tier-1
+  recovery as a manual operator/wake-run tool: accepts ONLY a bridge
+  job_id, operates only on verified descendants of that job, structured
+  JSON result, audit trail in `jobs/<id>/watchdog.jsonl`.
+* **Observability.** `pi_status`/`pi_list`/`pi-bridge health` expose the
+  watchdog state (last activity, suspicion age, diagnosis summary,
+  attempts, last action, recovered_at / needs_attention_at); pi-lamp
+  writer 1.4 + JS color the rows: blue working, amber pulse
+  silent-checking, orange recovering, red needs-attention, blue again
+  after recovery.
+* **Installer.** `./install.sh` now installs + enables the watchdog
+  timer/service and the stall route automatically (clean upgrade from
+  v0.4.2: the completion route, wake.json and all foreign config are
+  untouched); `./uninstall.sh` removes ONLY the bridge-owned watchdog
+  units and `<bridge_home>/watchdog` state — job history is preserved.
+
 ## 0.4.2 — 2026-10-19 (protocol V1.5, unchanged — fully backward-compatible)
 
 * **The WebUI completion poller is no longer poisoned by lazy gateway

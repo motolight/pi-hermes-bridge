@@ -1,12 +1,14 @@
 name: pi-worker
-version: 0.4.2
+version: 0.5.0
 description: >-
   Delegate coding tasks to the Pi orchestrator through the durable
-  pi-bridge (pi_delegate / pi_status / pi_feedback / pi_cancel / pi_list).
-  When a Pi turn completes the bridge records the outcome and the plugin
-  delivers it into Hermes' native background-completion pipeline in the
-  process hosting the origin session; the woken acceptance run only checks
-  the result, it never delivers.
+  pi-bridge (pi_delegate / pi_status / pi_feedback / pi_cancel / pi_list /
+  pi_recover). When a Pi turn completes the bridge records the outcome and
+  the plugin delivers it into Hermes' native background-completion pipeline
+  in the process hosting the origin session; the woken acceptance run only
+  checks the result, it never delivers. A server-side stall watchdog
+  detects, diagnoses and tier-1-recovers hung jobs on its own; pi_recover
+  is the bounded manual form of that same recovery.
 kind: standalone
 provides_tools:
   - pi_delegate
@@ -14,3 +16,4 @@ provides_tools:
   - pi_status
   - pi_feedback
   - pi_cancel
+  - pi_recover

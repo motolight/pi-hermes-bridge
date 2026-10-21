@@ -422,9 +422,10 @@ def test_wake_permanent_error_gives_up_early(env, workdir):
 # --------------------------------------------------------------------------
 
 # V1.4 adds the origin-delivery summary to the compact row as well.
+# v0.5.0 adds the compact watchdog state to the row as well.
 LIST_KEYS = {"job_id", "status", "cwd", "created_at", "updated_at",
              "task_preview", "feedback_turns", "turns", "wake", "delivery",
-             "origin"}
+             "origin", "watchdog"}
 
 
 def test_pi_list_rows_limit_and_no_transcript(env, workdir):
@@ -510,7 +511,7 @@ def test_pi_list_recovers_a_running_job(env, workdir):
         bridge("cancel", v["job_id"], check=0)
 
 
-def test_plugin_exposes_five_tools_and_pi_list(env, workdir, monkeypatch):
+def test_plugin_exposes_six_tools_and_pi_list(env, workdir, monkeypatch):
     import importlib.util
 
     monkeypatch.setenv("PI_BRIDGE_CLI", str(REPO / ".venv" / "bin" / "pi-bridge"))
@@ -528,7 +529,7 @@ def test_plugin_exposes_five_tools_and_pi_list(env, workdir, monkeypatch):
 
     mod.register(Ctx())
     assert sorted(registered) == ["pi_cancel", "pi_delegate", "pi_feedback",
-                                  "pi_list", "pi_status"]
+                                  "pi_list", "pi_recover", "pi_status"]
     for name, (schema, _) in registered.items():
         assert schema["name"] == name
         assert schema["description"].strip()

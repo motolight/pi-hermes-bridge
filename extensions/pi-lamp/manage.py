@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 
 EXT_ID = "pi-lamp"
-VERSION = "1.3.0"  # registration version; tracks the writer (1.3.0 delivery honesty)
+VERSION = "1.4.0"  # registration version; tracks the writer (1.4.0 stall-watchdog colours)
 SRC = Path(os.environ.get("PILAMP_SRC", str(Path(__file__).resolve().parent)))
 EXT_ROOT = Path(os.environ.get("PILAMP_EXT_ROOT",
                                str(Path.home() / ".hermes/webui/extensions/pi-lamp")))

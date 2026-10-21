@@ -54,13 +54,23 @@ def test_first_install_full_guided_setup(sandbox):
     # config.yaml: our route added, foreign route + global secret untouched
     doc = yaml_load(sandbox.cfg)
     routes = doc["platforms"]["webhook"]["extra"]["routes"]
-    assert set(routes) == {"other-team-route", "pi-bridge-complete"}
+    assert set(routes) == {"other-team-route", "pi-bridge-complete",
+                           "pi-bridge-stall"}
     assert routes["other-team-route"]["secret"] == "foreign-route-secret"
     assert doc["platforms"]["webhook"]["extra"]["secret"] == "foreign-global-secret"
     rt = routes["pi-bridge-complete"]
     assert rt["deliver"] == "log"
     assert rt["events"] == ["pi_bridge_turn_complete"]
     assert "pi_bridge" in rt["toolsets"]
+
+    # v0.5.0: the stall-watchdog route is a SEPARATE event type + policy on
+    # the same platform, with the same secret; the completion route untouched
+    sr = routes["pi-bridge-stall"]
+    assert sr["events"] == ["pi_bridge_stall"]
+    assert sr["deliver"] == "log"
+    assert sr["secret"] == rt["secret"]
+    assert "STALL" in sr["prompt"] and "pi_recover" in sr["prompt"]
+    assert "needs_attention" in sr["prompt"]
 
     # wake.json: written, 0600, loopback URL, same secret as the route
     wake = json.loads(sandbox.wake.read_text())
@@ -73,11 +83,13 @@ def test_first_install_full_guided_setup(sandbox):
     assert (sandbox.hermes / "plugins" / "pi-worker" / "plugin.yaml").is_file()
     assert (sandbox.hermes / "enabled_pi-worker").is_file()
     manifest = (sandbox.hermes / "plugins" / "pi-worker" / "plugin.yaml").read_text()
-    for t in ("pi_delegate", "pi_status", "pi_feedback", "pi_cancel", "pi_list"):
+    for t in ("pi_delegate", "pi_status", "pi_feedback", "pi_cancel",
+              "pi_list", "pi_recover"):
         assert t in manifest
     state = json.loads((sandbox.bridge / "hermes_setup.json").read_text())
     assert state["plugin_installed"] is True
     assert state["wake"]["route_owned"] is True
+    assert state["wake"]["stall_route_owned"] is True
 
     # pi-open-agents installed WITH consent + orchestrator created, no model
     assert "npm:pi-open-agents" in (sandbox.pi_agent / "settings.json").read_text()
@@ -110,7 +122,8 @@ def test_second_install_is_idempotent(sandbox):
     assert soul.count("pi-hermes-bridge:begin") == 1
     doc = yaml_load(sandbox.cfg)
     routes = doc["platforms"]["webhook"]["extra"]["routes"]
-    assert set(routes) == {"other-team-route", "pi-bridge-complete"}
+    assert set(routes) == {"other-team-route", "pi-bridge-complete",
+                           "pi-bridge-stall"}
     # no second backup file clobbering the first
     assert (sandbox.hermes / "config.yaml.pi-hermes-bridge.bak").is_file()
     assert not (sandbox.hermes / "config.yaml.pi-hermes-bridge.bak.1").exists()
@@ -143,7 +156,10 @@ manual-note: keep me
     routes = doc["platforms"]["webhook"]["extra"]["routes"]
     # exactly one pi-bridge-complete route (no second webhook created),
     # the manual one is left EXACTLY as it was, foreign text preserved
-    assert set(routes) == {"other-team-route", "pi-bridge-complete"}
+    # (the new bridge-owned stall route IS added next to it)
+    assert set(routes) == {"other-team-route", "pi-bridge-complete",
+                           "pi-bridge-stall"}
+    assert routes["pi-bridge-stall"]["secret"] == "manual-v01-secret"
     assert routes["pi-bridge-complete"]["prompt"] == "OLD MANUAL V0.1 PROMPT"
     assert "manual-note: keep me" in sandbox.cfg.read_text()
     # existing manual wake.json untouched (secret still matches the route)
@@ -280,6 +296,8 @@ def test_install_then_uninstall_roundtrip(sandbox):
     soul_user = sandbox.soul.read_text().index("my precious custom soul text")
     r = sandbox.uninstall(input="n\nn\n")   # keep state, keep checkout
     assert r.returncode == 0, r.stdout + r.stderr
+    assert "pi-bridge-stall: removed" in r.stdout
+    assert "stall watchdog units" in r.stdout
 
     soul = sandbox.soul.read_text()
     assert "pi-hermes-bridge" not in soul
