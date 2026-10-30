@@ -82,8 +82,9 @@ Bounded: at most `max_recovery_attempts` (default **2**) automatic tier-1
 attempts, then `needs_attention`: a `pi_bridge_stall` event with
 `severity=attention` to the Hermes stall route plus a direct user message
 along the job's origin channel (`hermes send`, argv-only, messaging
-platforms; webui origins learn it from the wake run and the red pi-lamp
-row). A manual `pi-bridge recover` / `pi_recover(job_id)` does not consume
+platforms — and the operator's opt-in `fallback_channel` for jobs whose
+origin has no channel, e.g. `webhook`; webui origins learn it from the wake
+run and the red pi-lamp row). A manual `pi-bridge recover` / `pi_recover(job_id)` does not consume
 the automatic budget and still confirms via the same window.
 
 ## Hermes integration

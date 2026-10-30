@@ -154,8 +154,14 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   the process that hosts the session (a real acceptance turn at the idle
   boundary, never a user-looking message, no session-lease contention; see
   [`docs/WEBUI_COMPLETION_EVENT_SPEC.md`](docs/WEBUI_COMPLETION_EVENT_SPEC.md));
-  and *nothing* for an empty/unknown origin (no default channel, no Telegram
-  fallback). argv only, never a shell, hard timeout, no retries — so a result
+  and *nothing along the origin* for an empty/`webhook`/`local`/unknown origin
+  (no default channel). If the operator wants finished cron/wake jobs to be
+  announced anyway, `wake.json` `fallback_channel` (e.g.
+  `"telegram:261266401"`) sends exactly **one** copy of that same summary to
+  one operator-owned chat, recorded as `channel: "<platform>-fallback"` — the
+  target is read from the operator's config or environment and never from a
+  job, so no submitter can redirect a result. argv only, never a shell, hard
+  timeout, no retries — so a result
   that merely looks like a dangerous command cannot be stuck behind an
   approval gate nobody can answer in a webhook session.
 * **Self-waking Hermes** — then the runner POSTs an HMAC-signed webhook to the

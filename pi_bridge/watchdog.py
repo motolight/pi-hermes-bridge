@@ -45,8 +45,10 @@ Design
   (same HMAC V2 scheme and port as the completion route), retried on
   every later tick until accepted or expired.  `needs_attention` also
   sends a direct user message along the job's origin (messaging
-  platforms only, same argv-only `hermes send` path as origin delivery;
-  the webui channel learns it from the wake run and the pi-lamp).
+  platforms only, same argv-only `hermes send` path as origin delivery,
+  including the operator's opt-in `fallback_channel` for jobs whose origin
+  names no channel; the webui channel learns it from the wake run and the
+  pi-lamp).
 
 Configuration (all optional; absent == enabled with these defaults)
 -------------------------------------------------------------------
@@ -897,8 +899,10 @@ def user_attention_text(job: dict, wd: dict) -> str:
 def notify_user_attention(job_id: str) -> dict:
     """Direct origin-channel message that the job needs a human (bounded,
     no retry, never raises).  webui origin: no direct injection (the
-    native completion-event pipeline is completion-only); the stall wake
-    route and pi-lamp carry that case."""
+    native completion-event pipeline is completion-only); a job whose origin
+    names no channel at all uses the operator's opt-in fallback channel, the
+    same policy as origin delivery.  Otherwise the stall wake route and
+    pi-lamp carry that case."""
     try:
         job = state.load_job(job_id)
         cfg = deliver.load_config()
@@ -906,11 +910,12 @@ def notify_user_attention(job_id: str) -> dict:
             return {"ok": False, "reason": "disabled"}
         text = user_attention_text(job, normalize_state(job))
         hermes = deliver.discover_hermes_bin(cfg)
-        p = deliver.plan(job, hermes, text)
+        p = deliver.plan(job, hermes, text,
+                         deliver.parse_fallback(cfg["fallback_channel"]))
         wd = normalize_state(job)
         result = {"attempted": True, "ok": False, "channel": p["channel"],
                   "reason": p["reason"] or "not-supported", "at": state.now_iso()}
-        if p["kind"] == "send" and p["argv"]:
+        if p["kind"] in ("send", "send-fallback") and p["argv"]:
             try:
                 rc, out, err = deliver._run_bounded(p["argv"], min(60.0, cfg["timeout"]))
                 result["ok"] = (rc == 0)

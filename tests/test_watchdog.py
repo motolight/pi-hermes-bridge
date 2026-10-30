@@ -544,6 +544,84 @@ def test_attention_user_message_uses_origin_send(env, fixture_pi,
         state.load_job(f.job_id))["last_action"]["user_message"]["ok"]
 
 
+def test_attention_user_message_never_also_uses_the_fallback(env, fixture_pi,
+                                                             monkeypatch):
+    """A stalled job that HAS a channel gets ONE message there; configuring a
+    fallback must not produce a second copy on the operator's chat."""
+    shim = env["tmp"] / "fake-hermes"
+    shim.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKE_HERMES} \"$@\"\n")
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PI_BRIDGE_HERMES_BIN", str(shim))
+    argv_out = env["tmp"] / "argv.jsonl"
+    monkeypatch.setenv("FAKE_HERMES_ARGV_OUT", str(argv_out))
+    monkeypatch.setenv("FAKE_HERMES_MODE", "ok")
+    (state.bridge_home() / "wake.json").write_text(json.dumps(
+        {"enabled": False, "fallback_channel": "telegram:261266401"}))
+
+    f = fixture_pi("hang", origin={"platform": "telegram", "chat_id": "42"})
+    res = watchdog.notify_user_attention(f.job_id)
+    assert res["ok"] is True and res["channel"] == "telegram:42", res
+    lines = argv_out.read_text().splitlines()
+    assert len(lines) == 1, lines
+    assert json.loads(lines[0])[:3] == ["send", "-t", "telegram:42"]
+
+
+def test_attention_user_message_for_a_webui_job_runs_no_cli(env, fixture_pi,
+                                                            monkeypatch):
+    """The V1.5 invariant holds on the watchdog path too: a webui job with a
+    session never gets a CLI send, fallback configured or not."""
+    shim = env["tmp"] / "fake-hermes"
+    shim.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKE_HERMES} \"$@\"\n")
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PI_BRIDGE_HERMES_BIN", str(shim))
+    argv_out = env["tmp"] / "argv.jsonl"
+    monkeypatch.setenv("FAKE_HERMES_ARGV_OUT", str(argv_out))
+    monkeypatch.setenv("FAKE_HERMES_MODE", "ok")
+    (state.bridge_home() / "wake.json").write_text(json.dumps(
+        {"enabled": False, "fallback_channel": "telegram:261266401"}))
+
+    f = fixture_pi("hang", origin={"platform": "webui",
+                                   "ui_session_id": "abc123"})
+    res = watchdog.notify_user_attention(f.job_id)
+    assert (res["ok"], res["channel"], res["reason"]) == (
+        False, "webui:abc123", "webui-via-wake-route")
+    assert not argv_out.exists() or argv_out.read_text() == ""
+
+
+def test_attention_user_message_uses_the_fallback_channel(env, fixture_pi,
+                                                          monkeypatch):
+    """A stalled job dispatched from cron/wake has origin=webhook, i.e. no
+    channel anyone reads: the operator's opt-in `fallback_channel` is what
+    actually tells the human, with the same one-shot argv-only `send`."""
+    shim = env["tmp"] / "fake-hermes"
+    shim.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKE_HERMES} \"$@\"\n")
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PI_BRIDGE_HERMES_BIN", str(shim))
+    argv_out = env["tmp"] / "argv.jsonl"
+    monkeypatch.setenv("FAKE_HERMES_ARGV_OUT", str(argv_out))
+    monkeypatch.setenv("FAKE_HERMES_MODE", "ok")
+    wake_path = state.bridge_home() / "wake.json"
+    wake_path.write_text(json.dumps(
+        {"enabled": False, "fallback_channel": "telegram:261266401"}))
+    os.chmod(wake_path, 0o600)
+
+    f = fixture_pi("hang", origin={"platform": "webhook",
+                                   "chat_id": "webhook:v2:x"})
+    res = watchdog.notify_user_attention(f.job_id)
+    assert res["ok"] is True, res
+    assert res["channel"] == "telegram-fallback"
+    argv = json.loads(argv_out.read_text().splitlines()[-1])
+    assert argv[:3] == ["send", "-t", "telegram:261266401"]
+    assert "WATCHDOG" in argv[3] and f.job_id in argv[3]
+
+    # without the knob: the same job stays silent (not-supported, no CLI call)
+    wake_path.write_text(json.dumps({"enabled": False}))
+    res = watchdog.notify_user_attention(f.job_id)
+    assert (res["ok"], res["channel"], res["reason"]) == (
+        False, None, "no-delivery-channel")
+    assert len(argv_out.read_text().splitlines()) == 1
+
+
 # ---------------------------------------------------------------------------
 # CLI + view integration
 # ---------------------------------------------------------------------------

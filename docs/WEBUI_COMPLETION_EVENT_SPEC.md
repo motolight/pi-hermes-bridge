@@ -22,11 +22,14 @@ Both branches are wrong. A user-like `chat -q` turn is not a transport.
 
 ## Fix surface (bridge + its Hermes plugin only)
 
-1. `pi_bridge/deliver.py` — for `origin.platform == "webui"` the runner no
-   longer runs any Hermes CLI. It writes a durable delivery REQUEST (spool)
+1. `pi_bridge/deliver.py` — for `origin.platform == "webui"` **with a usable
+   session id** the runner no longer runs any Hermes CLI. It writes a durable
+   delivery REQUEST (spool)
    into the job dir and records `delivery = {kind: "webui-event", attempted:
    true, ok: false, reason: "queued"}`. Messaging platforms (`hermes send`)
-   are unchanged; the wake webhook is unchanged.
+   are unchanged; the wake webhook is unchanged. (A `webui` origin whose
+   session id is missing/unusable has no channel at all, so the opt-in
+   `fallback_channel` applies to it -- a plain `hermes send`, never a resume.)
 
 2. `pi_bridge/webui_event.py` (new, stdlib-only) — the spool format and pure
    logic shared by the runner and the plugin:
@@ -79,7 +82,10 @@ Both branches are wrong. A user-like `chat -q` turn is not a transport.
      (pi_status remains the durable source of truth); Hermes internals
      missing -> `status="unsupported"`, `reason="hermes-internal-unavailable"`,
      retried every poll tick (e.g. plugin loaded before backend import).
-   * NO fallback to `chat -q` ever.
+   * NO fallback to `chat -q` ever. (The operator's opt-in `fallback_channel`
+     is a plain `hermes send` for jobs that have no session/channel of their
+     own; it never resumes a session and never reroutes a failed native
+     delivery.)
 
 If neither gate is ever true (browser never opened), the request stays
 pending forever, harmlessly: nothing is lost (job state + pi_status), the

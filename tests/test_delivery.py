@@ -297,8 +297,13 @@ def test_no_origin_delivers_nowhere(env, workdir, tmp_path):
 
 
 def test_local_and_unknown_platforms_deliver_nowhere(env, workdir, tmp_path):
+    """...provided the operator configured no fallback channel (the default).
+
+    `webhook` is in the list because it is the real production origin of every
+    cron/wake-dispatched job -- the case that made finished jobs silent.
+    """
     e, log = hermes_env(tmp_path)
-    for platform in ("local", "smoking_tube"):
+    for platform in ("local", "smoking_tube", "webhook"):
         jid = submit(env, workdir, ("--origin-platform", platform,
                                     "--origin-chat-id", "x1"),
                      extra_env=e)["job_id"]
@@ -534,3 +539,274 @@ def test_feedback_turn_delivers_again(env, workdir, tmp_path):
     req = spool(env, jid)
     assert req["turn"] == 2 and req["state"] == "pending"
     assert "one more turn" not in req["text"] or "RESUMED" in req["text"]
+
+
+# ---------------------------------------------------------------------------
+# the operator's fallback channel (opt-in): finished jobs must not go silent
+#
+# Motivation (2026-10-30, STAGE4 T15): a job dispatched from a cron/wake
+# session has origin.platform == "webhook" (or no origin at all), i.e. no
+# channel a human reads.  The result was on disk and in pi_status, and no
+# notification existed.  `fallback_channel` in wake.json sends EXACTLY ONE
+# copy of the same summary to one operator-owned chat -- never derived from a
+# job, never retried, and never used by a webui job (that delivery is the
+# native completion event and runs no CLI at all).
+# ---------------------------------------------------------------------------
+
+FALLBACK_TARGET = "telegram:261266401"
+WEBHOOK_ORIGIN = ("--origin-platform", "webhook",
+                  "--origin-chat-id",
+                  "webhook:v2:WyJkZWZhdWx0IiwicGktYnJpZGdlLXdha2UiLCJ0MSJd")
+
+
+def set_fallback(env, value=FALLBACK_TARGET):
+    """Operator config: fallback for channel-less origins, wake POST off."""
+    (env["home"] / "wake.json").write_text(json.dumps(
+        {"enabled": False, "origin_delivery": True,
+         "fallback_channel": value}))
+
+
+def test_webhook_origin_delivers_exactly_once_to_the_fallback(env, workdir,
+                                                              tmp_path):
+    """The T15 acceptance case: one message, delivery.ok=true, and the
+    channel name says WHY it went out (the origin had no channel)."""
+    set_fallback(env)
+    e, log = hermes_env(tmp_path)
+    jid = submit(env, workdir, WEBHOOK_ORIGIN, extra_env=e)["job_id"]
+
+    st = wait_delivery(jid, extra_env=e)
+    calls = read_calls(log)
+    assert len(calls) == 1, calls
+    argv = calls[0]
+    assert argv[0:3] == ["send", "-t", FALLBACK_TARGET]
+    assert argv[-1] == "-q"
+    assert jid in argv[3] and "FAKEOK" in argv[3]
+
+    d = st["delivery"]
+    assert (d["attempted"], d["ok"], d["kind"], d["channel"], d["reason"],
+            d["turn"]) == (True, True, "send-fallback", "telegram-fallback",
+                           "ok", 1)
+    assert st["status"] == "completed"
+
+
+def test_no_origin_at_all_also_reaches_the_fallback(env, workdir, tmp_path):
+    set_fallback(env)
+    e, log = hermes_env(tmp_path)
+    jid = submit(env, workdir, (), extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert st["delivery"]["ok"] is True
+    assert st["delivery"]["channel"] == "telegram-fallback"
+    assert read_calls(log)[0][2] == FALLBACK_TARGET
+
+
+def test_a_live_origin_still_gets_one_message_on_its_own_channel(env, workdir,
+                                                                 tmp_path):
+    """A fallback must never become a second copy for a job that HAS a channel."""
+    set_fallback(env)
+    e, log = hermes_env(tmp_path)
+    jid = submit(env, workdir, ("--origin-platform", "telegram",
+                                "--origin-chat-id", "777000111"),
+                 extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    calls = read_calls(log)
+    assert len(calls) == 1, calls
+    assert calls[0][2] == "telegram:777000111"    # the ORIGIN, not the fallback
+    assert st["delivery"]["channel"] == "telegram:777000111"
+    assert st["delivery"]["kind"] == "send"
+
+
+def test_webui_origin_never_touches_the_fallback(env, workdir, tmp_path):
+    """The V1.5 invariant survives the fallback: a webui job runs NO CLI."""
+    set_fallback(env)
+    e, log = hermes_env(tmp_path, mode="refused")
+    jid = submit(env, workdir, WEBUI_ORIGIN, extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert read_calls(log) == []
+    assert st["delivery"]["kind"] == "webui-event"
+    assert st["delivery"]["reason"] == "queued"
+    assert spool(env, jid) is not None
+
+
+def test_undeliverable_origin_still_uses_the_fallback(env, workdir, tmp_path):
+    """webui with no usable session id / a messaging platform with no chat id
+    are 'no channel' cases, not webui-delivery cases."""
+    set_fallback(env)
+    e, log = hermes_env(tmp_path)
+    jid = submit(env, workdir, ("--origin-platform", "webui",
+                                "--origin-chat-id", "b ad"),
+                 extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert st["delivery"]["channel"] == "telegram-fallback"
+    assert read_calls(log)[0][2] == FALLBACK_TARGET
+
+    jid = submit(env, workdir, ("--origin-platform", "telegram",),
+                 extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert st["delivery"]["channel"] == "telegram-fallback"
+    assert len(read_calls(log)) == 2
+
+
+def test_a_bad_fallback_target_is_ignored_not_guessed(env, workdir, tmp_path):
+    """Misconfiguration reads as 'no fallback', never as 'send somewhere'."""
+    for bad in ("telegram", "webhook:261266401", "webui:123", "smoking_tube:1",
+                "telegram:2 6", "telegram:1:2:3"):
+        set_fallback(env, bad)
+        e, log = hermes_env(tmp_path)
+        jid = submit(env, workdir, WEBHOOK_ORIGIN, extra_env=e)["job_id"]
+        st = wait_delivery(jid, extra_env=e)
+        assert st["status"] == "completed", bad
+        assert st["delivery"]["reason"] == "no-delivery-channel", (bad, st)
+        assert st["delivery"]["attempted"] is False, bad
+    # one shared argv log across the loop -> this proves NO iteration sent
+    # anything at all
+    assert read_calls(log) == []
+
+
+def test_fallback_failure_is_data_never_a_retry(env, workdir, tmp_path):
+    set_fallback(env)
+    e, log = hermes_env(tmp_path, mode="blocked")
+    jid = submit(env, workdir, WEBHOOK_ORIGIN, extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert st["status"] == "completed"
+    d = st["delivery"]
+    assert (d["attempted"], d["ok"], d["channel"], d["reason"]) == (
+        True, False, "telegram-fallback", "cli-failed")
+    assert len(read_calls(log)) == 1, "a failed fallback is never retried"
+
+
+def test_fallback_env_var_overrides_the_file(env, workdir, tmp_path):
+    set_fallback(env, "telegram:261266401")
+    e, log = hermes_env(tmp_path,
+                        extra={"PI_BRIDGE_DELIVERY_FALLBACK": "matrix:room9"})
+    jid = submit(env, workdir, WEBHOOK_ORIGIN, extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert read_calls(log)[0][2] == "matrix:room9"
+    assert st["delivery"]["channel"] == "matrix-fallback"
+
+
+def test_redelivery_of_the_same_turn_never_sends_twice(env, workdir, tmp_path,
+                                                       monkeypatch):
+    """The runner's own guard is what makes 'one notification' hold across a
+    restart or any re-entry: the same turn is never delivered twice."""
+    from pi_bridge import deliver
+
+    set_fallback(env)
+    e, log = hermes_env(tmp_path)
+    jid = submit(env, workdir, WEBHOOK_ORIGIN, extra_env=e)["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert st["delivery"]["ok"] is True
+    assert len(read_calls(log)) == 1
+
+    monkeypatch.setenv("PI_BRIDGE_HOME", str(env["home"]))
+    again = deliver.deliver_result(jid, 1)
+    assert again["reason"] == "already-attempted"
+    assert len(read_calls(log)) == 1, "a re-delivery must not re-send"
+
+
+def test_failed_turn_reaches_the_fallback_too(env, workdir, tmp_path):
+    set_fallback(env)
+    e, log = hermes_env(tmp_path)
+    jid = submit(env, workdir, WEBHOOK_ORIGIN, extra_env=e,
+                 task="BRIDGE_FAIL")["job_id"]
+    st = wait_delivery(jid, extra_env=e)
+    assert st["status"] == "failed"
+    assert st["delivery"]["ok"] is True
+    body = read_calls(log)[0][3]
+    assert "завершилась ошибкой" in body and "boom" in body
+
+
+# ---------------------------------------------------------------------------
+# unit: the fallback policy, without a subprocess
+# ---------------------------------------------------------------------------
+
+def _fb_job(origin):
+    return {"job_id": "j1", "status": "completed", "task": "t",
+            "turns": [{}], "final_result": "ok", "origin": origin}
+
+
+def test_parse_fallback_accepts_only_a_real_messaging_target(env, monkeypatch):
+    from pi_bridge import deliver
+
+    monkeypatch.setenv("PI_BRIDGE_HOME", str(env["home"]))
+    for spec, want in (("telegram:261266401",
+                        ("telegram", "telegram:261266401")),
+                       (" Telegram:261266401 ",
+                        ("telegram", "telegram:261266401")),
+                       ("telegram:261266401:4242",
+                        ("telegram", "telegram:261266401:4242"))):
+        assert deliver.parse_fallback(spec) == {"platform": want[0],
+                                                "target": want[1]}, spec
+    for bad in ("", "   ", "telegram", "telegram:", "webui:123", "webhook:1",
+                "local", "telegram:261266401:42:7", "telegram:2 6",
+                "telegram:;rm -rf /"):
+        assert deliver.parse_fallback(bad) is None, bad
+
+
+def test_plan_uses_the_fallback_only_for_a_channel_less_origin(env,
+                                                               monkeypatch):
+    from pi_bridge import deliver
+
+    monkeypatch.setenv("PI_BRIDGE_HOME", str(env["home"]))
+    fb = deliver.parse_fallback(FALLBACK_TARGET)
+    argv = [str(FAKE_HERMES), "send", "-t", FALLBACK_TARGET, "text", "-q"]
+
+    for origin in ({},
+                   {"platform": "webhook", "chat_id": "webhook:v2:x"},
+                   {"platform": "local"},
+                   {"platform": "telegram"}):     # messaging, no chat id
+        p = deliver.plan(_fb_job(origin), str(FAKE_HERMES), "text", fb)
+        assert p["kind"] == "send-fallback", origin
+        assert p["channel"] == "telegram-fallback", origin
+        assert p["argv"] == argv, origin
+        assert p["target"] == FALLBACK_TARGET, origin
+
+    # a live origin keeps its own channel, and never both
+    p = deliver.plan(_fb_job({"platform": "telegram", "chat_id": "777"}),
+                     str(FAKE_HERMES), "text", fb)
+    assert (p["kind"], p["channel"], p["argv"][3]) == ("send", "telegram:777",
+                                                       "telegram:777")
+    # a webui origin stays CLI-free, binary present or not
+    for binary in (str(FAKE_HERMES), "", "/does/not/exist/hermes"):
+        p = deliver.plan(_fb_job({"platform": "webui",
+                                  "ui_session_id": "abc"}),
+                         binary, "text", fb)
+        assert p["kind"] == "webui-event" and p["argv"] is None, binary
+    # a missing binary is a misconfiguration, not a missing channel
+    p = deliver.plan(_fb_job({}), "", "text", fb)
+    assert p["kind"] is None and p["reason"] == "hermes-binary-not-found"
+    # and with no fallback configured the plan is exactly what it was before
+    assert deliver.plan(_fb_job({}), str(FAKE_HERMES), "text") == {
+        "kind": None, "channel": None, "argv": None, "reason": "no-origin"}
+
+
+def test_load_config_reads_the_fallback_and_env_wins(env, monkeypatch):
+    from pi_bridge import deliver
+
+    monkeypatch.setenv("PI_BRIDGE_HOME", str(env["home"]))
+    monkeypatch.delenv("PI_BRIDGE_DELIVERY_FALLBACK", raising=False)
+    assert deliver.load_config()["fallback_channel"] == ""
+    (env["home"] / "wake.json").write_text(json.dumps(
+        {"fallback_channel": "telegram:261266401"}))
+    assert deliver.load_config()["fallback_channel"] == "telegram:261266401"
+    monkeypatch.setenv("PI_BRIDGE_DELIVERY_FALLBACK", "matrix:room9")
+    assert deliver.load_config()["fallback_channel"] == "matrix:room9"
+
+
+def test_the_fallback_is_never_planned_without_a_runnable_binary(env,
+                                                                 monkeypatch):
+    """A missing/dangling `hermes` is a misconfiguration, never a channel.
+
+    The webui branch reaches the fallback without passing the binary pre-flight
+    that the messaging branch gets, so `_nowhere()` checks it itself: planning
+    an argv with an unusable binary would report `not-runnable`, burn the
+    one-shot `attempted` marker and lie about what happened.
+    """
+    from pi_bridge import deliver
+
+    monkeypatch.setenv("PI_BRIDGE_HOME", str(env["home"]))
+    fb = deliver.parse_fallback(FALLBACK_TARGET)
+    for bad_bin in ("", "/does/not/exist/hermes"):
+        p = deliver.plan(_fb_job({"platform": "webui", "chat_id": "b ad"}),
+                         bad_bin, "text", fb)
+        assert (p["kind"], p["reason"], p["argv"]) == (
+            None, "no-webui-session-id", None), bad_bin

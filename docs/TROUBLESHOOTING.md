@@ -44,16 +44,16 @@ recover context without creating a duplicate delegate.
 
 ## Outcome never reached the WebUI conversation (V1.4: the runner delivers)
 
-Since V1.4 the **runner** delivers the outcome along the job's origin
-(`hermes --resume <ui_session_id> chat -q … -Q --source tool` for `webui`,
-`hermes send -t <platform>:<chat_id>[:<thread_id>]` for messaging platforms);
-the woken run does a read-only acceptance check and never sends anything.
+Since V1.4 the **runner** delivers the outcome along the job's origin — a
+native completion event for `webui` (V1.5: no CLI at all), `hermes send -t
+<platform>:<chat_id>[:<thread_id>]` for messaging platforms; the woken run does
+a read-only acceptance check and never sends anything.
 Diagnose with `.delivery.reason`:
 
 | reason | meaning | what to do |
 |---|---|---|
 | `ok` | delivered | — |
-| `no-origin` / `no-delivery-channel` / `no-webui-session-id` / `no-chat-id` | nothing to deliver to (CLI-submitted or pre-V1.3 job, or `local`) | intended: log-only, the result stays in `pi_status` |
+| `no-origin` / `no-delivery-channel` / `no-webui-session-id` / `no-chat-id` | nothing to deliver to (CLI-submitted or pre-V1.3 job, `local`, or a cron/wake-dispatched job whose origin is `webhook`) | the result stays in `pi_status`. To get ONE notification for those jobs anyway, set `fallback_channel` in `wake.json` (e.g. `"telegram:261266401"`) — then `.delivery` reads `kind: send-fallback`, `channel: "<platform>-fallback"`, `ok: true` |
 | `session_not_owned` | the WebUI session is leased by a live process | intended fail-fast; no retry, no rerouting. Close the session in its surface if you want the announcement |
 | `timeout` | the resumed turn outran `delivery_timeout` (default 240 s) | a resume is a full agent turn; raise `delivery_timeout` for slow models / huge sessions |
 | `hermes-binary-not-found` / `not-runnable` | the runner cannot find `hermes` | set `hermes_bin` in `wake.json` to an absolute path (transient systemd units get a clean PATH) |

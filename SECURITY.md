@@ -38,12 +38,37 @@ for it, by code rather than by a model's shell command.
   never through a shell**, outside the agent's terminal tool — so the
   dangerous-command approval gate is not involved and result text quoted into
   a message cannot be re-interpreted as a command.
-- Routing is fixed in code and strictly origin-based: messaging platform →
-  `hermes send -t <platform>:<chat_id>[:<thread_id>]`, `webui` →
-  `hermes --resume <ui_session_id> chat -q … -Q --source tool`, anything else
-  (empty, `local`, unknown platform, missing id) → **nothing is sent**.
-  There is no default channel and no fallback target, so a job can never be
-  announced into an unrelated chat.
+- Routing is fixed in code and strictly origin-based: messaging platform with
+  a chat id → `hermes send -t <platform>:<chat_id>[:<thread_id>]`, `webui` with
+  a usable session id → a durable completion event handed to the bridge plugin
+  in-process (V1.5, never a CLI), anything else (empty, `webhook`, `local`,
+  unknown platform, missing id) → **nothing along the origin**.
+- **There is no default channel.** The one exception is opt-in: `fallback_channel`
+  in `wake.json` (or `PI_BRIDGE_DELIVERY_FALLBACK`, forwarded to the runner the
+  same way as `PI_BRIDGE_HERMES_BIN`) names a single operator-owned chat that
+  receives the summary of a job whose origin has no channel at all. What the
+  fallback does and does not give anyone:
+  * the target is read from the **operator's** config/environment — never from
+    a job, its `origin`, or its result text, so a finished job can never
+    redirect its own notification, and the text of an untrusted result is only
+    ever a message body (one argv element, `MEDIA:`/`[[as_document]]`
+    neutralised, length-bounded);
+  * a malformed or non-messaging target **disables** the fallback rather than
+    being guessed;
+  * it is off when unset (the default) and off entirely under
+    `origin_delivery: false`; it is never used for a `webui` job that does have
+    a usable session, and never used as a second copy for a job that has a
+    channel of its own;
+  * the runner sends at most one message per (job, turn) — a failed fallback is
+    recorded, not retried, and a re-entry never re-sends. (The watchdog's
+    `needs_attention` message uses the same target but is a different, separate
+    notice: one per transition into `needs_attention`, not per turn.)
+
+  This adds no addressing power a caller did not already have: whoever submits
+  a job already chooses where its result goes by passing `--origin-*` (see
+  below), so the fallback only ever covers the case where the caller named no
+  channel at all. Recorded as `delivery.channel = "<platform>-fallback"`, so an
+  audit always shows the message went out because the origin had no channel.
 - The delivered summary is length-bounded (`delivery_max_chars`, default
   1200) and `MEDIA:` / `[[as_document]]` markers inside a result are
   neutralised: untrusted Pi output cannot turn the delivery into a file

@@ -30,17 +30,35 @@ by the job's recorded `origin`, with a hard timeout and no retries.
 
 Policy (fixed, no configuration of routes)
 ------------------------------------------
-* `origin.platform` is a messaging platform -> `hermes send -t
+* `origin.platform` is a messaging platform WITH a usable chat id ->
+  `hermes send -t
   <platform>:<chat_id>[:<thread_id>] <text> -q`
-* `origin.platform == "webui"` -> **no Hermes CLI at all** (V1.5): a durable
+* `origin.platform == "webui"` **with a usable session id** -> no Hermes CLI at
+  all (V1.5): a durable
   spool request is written into the job directory and the bridge's Hermes
   plugin injects the completion into Hermes' own native background-completion
   pipeline, in-process, in the backend that hosts the session.  Running
   `hermes --resume ... chat -q` against a live webui session raced the
   backend's lease and in-memory history and orphaned user-like messages --
   see docs/WEBUI_COMPLETION_EVENT_SPEC.md.
-* origin empty, `local`, or an unknown platform -> deliver NOTHING anywhere.
-  There is deliberately **no default channel and no Telegram fallback**.
+* the origin names **no channel a human can read** -- empty, `webhook`,
+  `local`, an unknown platform, a messaging platform with no usable chat id,
+  or a `webui` origin with no usable session id -- -> nothing is delivered
+  **along the origin**.  When the operator has configured a
+  **fallback channel** (`fallback_channel` in `wake.json`, e.g.
+  `"telegram:261266401"`, or the `PI_BRIDGE_DELIVERY_FALLBACK` env var) that
+  one summary goes there instead, once, recorded as
+  `channel: "<platform>-fallback"`.
+
+  The fallback is **opt-in and off by default** (no `fallback_channel` = the
+  old "deliver nowhere" behaviour, byte for byte), it is **never retried**,
+  and its target comes **only from the operator's own config file or
+  environment** -- never from a job, its `origin` or its result text.  A `webui`
+  origin WITH a usable session id never uses it either: that delivery is the
+  native completion event and runs no Hermes CLI at all (see
+  docs/WEBUI_COMPLETION_EVENT_SPEC.md); only a `webui` origin with no usable
+  session id -- no channel at all -- falls back, and it falls back to a plain
+  `send`, never to a `chat -q` resume.
 
 Configuration (same file as the wake notifier; `~/.local/state/pi-bridge/wake.json`)
 -------------------------------------------------------------------------------------
@@ -49,7 +67,8 @@ Configuration (same file as the wake notifier; `~/.local/state/pi-bridge/wake.js
      "origin_delivery": true,          # false -> this module is a no-op
      "hermes_bin": "",                 # optional absolute path
      "delivery_timeout": 240,          # seconds, SIGTERM then SIGKILL
-     "delivery_max_chars": 1200}       # size of the delivered summary
+     "delivery_max_chars": 1200,       # size of the delivered summary
+     "fallback_channel": ""}           # e.g. "telegram:261266401" (opt-in)
 
 `origin_delivery` defaults to **true**, and it is **independent of the wake
 notifier**: `wake.json` `{"enabled": false}` silences the wake POST but not the
@@ -100,6 +119,15 @@ MIN_TIMEOUT = 1.0
 OUTPUT_KEEP = 300
 ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
+# Reasons that mean "this job's origin names no channel a human reads".  Only
+# these may fall back to the operator's fallback channel.  A webui origin WITH
+# a session id is deliberately absent: its delivery is the native completion
+# event (never a CLI).  hermes-binary-not-found is a misconfiguration, not a
+# missing channel -- a fallback would fail on the very same missing binary.
+FALLBACK_ELIGIBLE_REASONS = frozenset({
+    "no-origin", "no-delivery-channel", "no-chat-id", "no-webui-session-id",
+})
+
 # Reason codes recorded in job["delivery"]["reason"] (never a secret).
 REASON_OK = "ok"
 
@@ -145,6 +173,11 @@ def load_config() -> dict:
                                 if isinstance(raw.get("delivery_max_chars"),
                                               (int, float)) else
                                 DEFAULT_MAX_CHARS),
+        # Operator-owned fallback target ("platform:chat_id[:thread]").
+        # Env wins over the file, exactly like hermes_bin.  Never derived
+        # from a job.
+        "fallback_channel": (os.environ.get("PI_BRIDGE_DELIVERY_FALLBACK")
+                             or str(raw.get("fallback_channel") or "")),
     }
     out["timeout"] = min(MAX_TIMEOUT, max(MIN_TIMEOUT, out["timeout"]))
     out["max_chars"] = max(200, int(out["max_chars"]))
@@ -206,11 +239,66 @@ def build_text(job: dict, max_chars: int) -> str:
 # target planning (pure: no subprocess, testable directly)
 # ---------------------------------------------------------------------------
 
-def plan(job: dict, hermes_bin: str, text: str) -> dict:
+def parse_fallback(spec: str) -> dict | None:
+    """Parse the operator's fallback target 'platform:chat_id[:thread_id]'.
+
+    Returns {platform, target} or None.  Anything malformed, empty or not a
+    messaging platform disables the fallback -- it never degrades into 'send
+    somewhere vague'.  The value is read from wake.json / the environment by
+    the operator, never from a job.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    parts = [p.strip() for p in spec.split(":")]
+    if len(parts) not in (2, 3):
+        return None
+    platform, chat = parts[0].lower(), parts[1]
+    thread = parts[2] if len(parts) == 3 else ""
+    if (platform not in MESSAGING_PLATFORMS or not chat
+            or not ID_RE.fullmatch(chat)):
+        return None
+    if thread and not ID_RE.fullmatch(thread):
+        return None
+    target = f"{platform}:{chat}" + (f":{thread}" if thread else "")
+    return {"platform": platform, "target": target}
+
+
+def _binary_ok(hermes_bin: str) -> bool:
+    """A usable CLI: discovered, and an existing file (not a dangling path)."""
+    return bool(hermes_bin) and os.path.isfile(hermes_bin)
+
+
+def _nowhere(reason: str, fallback: dict | None, hermes_bin: str,
+             text: str) -> dict:
+    """An origin with no channel: the operator's fallback, or genuinely nowhere."""
+    if (fallback and reason in FALLBACK_ELIGIBLE_REASONS
+            and _binary_ok(hermes_bin)):
+        # The binary check matters only on the webui path: for a messaging
+        # origin a missing binary already returned hermes-binary-not-found
+        # above.  Planning a `send` without a runnable CLI would report a
+        # lie (`not-runnable`) and burn the one-shot `attempted` marker.
+        return {
+            "kind": "send-fallback",
+            # The channel name says *why* the message went out (the origin
+            # had no channel), not only where: `telegram-fallback`.
+            "channel": f"{fallback['platform']}-fallback",
+            "argv": [hermes_bin, "send", "-t", fallback["target"], text, "-q"],
+            "reason": None,
+            "target": fallback["target"],
+        }
+    return {"kind": None, "channel": None, "argv": None, "reason": reason}
+
+
+def plan(job: dict, hermes_bin: str, text: str,
+         fallback: dict | None = None) -> dict:
     """What delivery would look like for this job: {kind, channel, argv, reason}.
 
     `kind` is None for "deliver nowhere" (that is a *success* per policy, not
-    a failure: there simply is no user channel).  `argv` is None for
+    a failure: there simply is no user channel, and the operator turned no
+    fallback on).  `kind == "send-fallback"` is the operator's configured
+    fallback channel, used only when the origin names no channel at all; its
+    `target` key carries the real address for the log.  `argv` is None for
     "webui-event": that delivery is a durable spool request consumed by the
     bridge's Hermes plugin in-process (V1.5, see
     docs/WEBUI_COMPLETION_EVENT_SPEC.md) -- it never runs a Hermes CLI and
@@ -221,8 +309,10 @@ def plan(job: dict, hermes_bin: str, text: str) -> dict:
     if platform == WEBUI_PLATFORM:
         sid = origin.get("ui_session_id") or origin.get("chat_id") or ""
         if not sid or not ID_RE.fullmatch(sid):
-            return {"kind": None, "channel": None, "argv": None,
-                    "reason": "no-webui-session-id"}
+            # No session to inject into: there is no channel here either, so
+            # the operator's fallback applies (a webui job is still never
+            # delivered by a CLI -- `send` is not a `chat -q` resume).
+            return _nowhere("no-webui-session-id", fallback, hermes_bin, text)
         return {
             "kind": "webui-event",
             "channel": f"webui:{sid}",
@@ -241,8 +331,7 @@ def plan(job: dict, hermes_bin: str, text: str) -> dict:
     if platform in MESSAGING_PLATFORMS:
         chat = origin.get("chat_id") or ""
         if not chat or not ID_RE.fullmatch(chat):
-            return {"kind": None, "channel": None, "argv": None,
-                    "reason": "no-chat-id"}
+            return _nowhere("no-chat-id", fallback, hermes_bin, text)
         target = f"{platform}:{chat}"
         thread = origin.get("thread_id") or ""
         if thread and ID_RE.fullmatch(thread):
@@ -253,8 +342,8 @@ def plan(job: dict, hermes_bin: str, text: str) -> dict:
             "argv": [hermes_bin, "send", "-t", target, text, "-q"],
             "reason": None,
         }
-    return {"kind": None, "channel": None, "argv": None,
-            "reason": "no-delivery-channel" if platform else "no-origin"}
+    return _nowhere("no-delivery-channel" if platform else "no-origin",
+                    fallback, hermes_bin, text)
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +489,12 @@ def _deliver(job_id: str, turn_n: int) -> dict:
 
     text = build_text(job, cfg["max_chars"])
     hermes = discover_hermes_bin(cfg)
-    p = plan(job, hermes, text)
+    p = plan(job, hermes, text, parse_fallback(cfg["fallback_channel"]))
+    # What the log shows: a fallback names the channel it *replaced* plus the
+    # real address it used, so an operator can always tell the two apart.
+    where = p["channel"] or "nowhere"
+    if p.get("target") and p["target"] != p["channel"]:
+        where = f"{p['channel']} -> {p['target']}"
 
     if p["kind"] is None:
         # Nothing to do is the normal outcome for local/unknown origins.
@@ -434,7 +528,7 @@ def _deliver(job_id: str, turn_n: int) -> dict:
                 "kind": "webui-event"}
 
     started = time.monotonic()
-    _log(jd, f"turn {turn_n} delivery -> {p['channel']} ({p['kind']}, "
+    _log(jd, f"turn {turn_n} delivery -> {where} ({p['kind']}, "
              f"{len(text)} chars)")
     try:
         rc, out, err = _run_bounded(p["argv"], cfg["timeout"])
@@ -444,14 +538,14 @@ def _deliver(job_id: str, turn_n: int) -> dict:
                 kind=p["kind"], reason="timeout",
                 error=f"killed after {cfg['timeout']:.0f}s", turn=turn_n,
                 at=state.now_iso())
-        _log(jd, f"turn {turn_n} delivery -> {p['channel']}: timed out after "
+        _log(jd, f"turn {turn_n} delivery -> {where}: timed out after "
                  f"{dur:.1f}s (no retry)")
         return {"ok": False, "reason": "timeout", "channel": p["channel"]}
     except OSError as e:
         _update(job_id, attempted=True, ok=False, channel=p["channel"],
                 kind=p["kind"], reason="not-runnable",
                 error=str(e)[:300], turn=turn_n, at=state.now_iso())
-        _log(jd, f"turn {turn_n} delivery -> {p['channel']}: not runnable: {e}")
+        _log(jd, f"turn {turn_n} delivery -> {where}: not runnable: {e}")
         return {"ok": False, "reason": "not-runnable",
                 "channel": p["channel"]}
 
@@ -459,7 +553,7 @@ def _deliver(job_id: str, turn_n: int) -> dict:
         _update(job_id, attempted=True, ok=True, channel=p["channel"],
                 kind=p["kind"], reason=REASON_OK, error=None, turn=turn_n,
                 at=state.now_iso())
-        _log(jd, f"turn {turn_n} delivery -> {p['channel']}: ok")
+        _log(jd, f"turn {turn_n} delivery -> {where}: ok")
         return {"ok": True, "channel": p["channel"], "kind": p["kind"]}
 
     reason = _classify_returncode(err)
@@ -467,6 +561,6 @@ def _deliver(job_id: str, turn_n: int) -> dict:
             kind=p["kind"], reason=reason,
             error=(err.strip() or out.strip() or f"rc={rc}")[:OUTPUT_KEEP],
             turn=turn_n, at=state.now_iso())
-    _log(jd, f"turn {turn_n} delivery -> {p['channel']}: {reason} (rc={rc}); "
-             "no retry, no fallback channel")
+    _log(jd, f"turn {turn_n} delivery -> {where}: {reason} (rc={rc}); "
+             "no retry, no further channel")
     return {"ok": False, "reason": reason, "channel": p["channel"], "rc": rc}

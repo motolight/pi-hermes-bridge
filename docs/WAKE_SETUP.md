@@ -232,8 +232,10 @@ That is what lost the result of a completed job on 2026-10-07
 So from V1.4 the **runner itself** delivers the outcome
 (`pi_bridge/deliver.py`) before it wakes anyone: an argv-only `hermes`
 subprocess, never a shell, strictly along the job's recorded `origin`, with a
-hard timeout, no retries and no fallback channel. The woken run is a
-read-only acceptance check.
+hard timeout and no retries. The woken run is a read-only acceptance check.
+When the origin names no channel at all (a cron/wake-dispatched job: `webhook`,
+empty, `local`, unknown, or a missing id) nothing is sent **unless** the
+operator opts in with `fallback_channel` (below).
 
 ### Origin-delivery knobs (same `wake.json`)
 
@@ -242,7 +244,8 @@ read-only acceptance check.
  "origin_delivery": true,             // false -> never call the CLI (V1.3 log-only)
  "hermes_bin": "/ABS/PATH/TO/hermes", // optional; systemd units get a clean PATH
  "delivery_timeout": 240,             // seconds, SIGTERM then kill; never retried
- "delivery_max_chars": 1200}          // size of the delivered summary
+ "delivery_max_chars": 1200,          // size of the delivered summary
+ "fallback_channel": ""}              // e.g. "telegram:261266401" (opt-in, off by default)
 ```
 
 Discovery order for the CLI: `PI_BRIDGE_HERMES_BIN` > `hermes_bin` > `PATH`
@@ -257,14 +260,27 @@ Routing policy (fixed in code, not configurable):
 | `origin.platform` | what runs |
 |---|---|
 | telegram / discord / slack / signal / whatsapp / mattermost / matrix | `hermes send -t <platform>:<chat_id>[:<thread_id>] <text> -q` |
-| `webui` | `hermes --resume <ui_session_id> chat -q <text> -Q --source tool` |
-| empty, `local`, unknown, or a missing id | **nothing anywhere** (`delivery.reason = no-origin / no-delivery-channel`) |
+| `webui` | **no Hermes CLI** (V1.5): a durable completion event next to the job, injected by the bridge plugin — see [`WEBUI_COMPLETION_EVENT_SPEC.md`](WEBUI_COMPLETION_EVENT_SPEC.md) |
+| empty, `webhook`, `local`, unknown, or a missing id | **nothing anywhere** (`delivery.reason = no-origin / no-delivery-channel / no-chat-id / no-webui-session-id`) — or ONE copy to `fallback_channel` when configured (`delivery.kind = send-fallback`, `delivery.channel = "<platform>-fallback"`) |
 
-There is no default channel and no Telegram fallback. `MEDIA:` prefixes and
+With no `fallback_channel` there is no default channel and no Telegram
+fallback, exactly as before. `MEDIA:` prefixes and
 `[[as_document]]` inside a result are neutralised, so a result can never turn
-into an attachment. A `webui` resume refused by the session lease
-(`SESSION_NOT_OWNED`) is permanent for that turn: the durable result stays in
-`pi_status`, nothing is retried and nothing is rerouted.
+into an attachment. A `webui` completion event that the plugin cannot hand to
+Hermes is recorded as `abandoned`/`hermes-internal-unavailable`: the durable
+result stays in `pi_status`, nothing is retried into a CLI and nothing is
+rerouted to another chat (the fallback channel is for jobs that have **no**
+channel of their own, not for a delivery that failed).
+
+**Why the fallback exists.** A job dispatched from a cron or wake session has
+`origin.platform = "webhook"` — an ephemeral per-delivery webhook key, not a
+chat anyone reads. Before this knob such jobs finished silently: the report
+was on disk (`final_result.md`) and in `pi_status`, and no notification
+existed. The fallback changes the notification only; it never re-runs, retries
+or re-dispatches anything, and the per-turn `already-attempted` guard in
+`deliver.py` means a re-entry (restart, manual retry) cannot send a second
+copy. `origin_delivery: false` switches it off together with all other
+outbound delivery.
 
 ### Recommended route prompt (V1.4)
 
@@ -319,6 +335,13 @@ JSON
 chmod 600 ~/.local/state/pi-bridge/wake.json
 ```
 
+> Re-running `install.sh` (its `hermes-setup wake-write` step), or
+> `pi-bridge hermes-setup wake-write --force`, **rewrites** an installer-owned
+> `wake.json` as `{enabled, url, secret}`. Delivery knobs
+> (`origin_delivery`, `hermes_bin`, `delivery_*`, `fallback_channel`) have to
+> be re-applied afterwards — the failure is silent: without `fallback_channel`
+> the bridge simply goes back to announcing nothing for channel-less jobs.
+
 Rules (`pi_bridge/wake.py:load_config`): missing file, unreadable/malformed
 JSON, `enabled != true`, empty `url`, empty `secret` or a non-`http(s)` URL all
 mean **wake off** — the bridge behaves exactly like V1 (no requests, no extra
@@ -336,6 +359,7 @@ Knobs (env, for the runner process; defaults shown):
 | `PI_BRIDGE_WAKE_PIWEB_BUDGET` | `3` | seconds spent building the optional `pi_web_url` link |
 | `PI_BRIDGE_DELIVERY_TIMEOUT` | `240` | origin-delivery hard timeout (also `delivery_timeout` in `wake.json`) |
 | `PI_BRIDGE_DELIVERY_MAX_CHARS` | `1200` | size of the delivered summary (also `delivery_max_chars`) |
+| `PI_BRIDGE_DELIVERY_FALLBACK` | — | fallback target `platform:chat_id[:thread]` for jobs whose origin has no channel (also `fallback_channel`; env wins over the file) |
 | `PI_BRIDGE_HERMES_BIN` | — | absolute path of the `hermes` CLI used for delivery |
 
 **Kill switches, and they are separate.** `wake.json` `enabled: false` stops

@@ -5,6 +5,35 @@ the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
 the `V1.x` labels in the prose and in `docs/` name the bridge protocol
 revision, which is tracked independently of the package version.
 
+## Unreleased — protocol V1.5 (unchanged), backward-compatible
+
+* **Opt-in fallback delivery channel** (`wake.json` `fallback_channel`,
+  env `PI_BRIDGE_DELIVERY_FALLBACK`). A job whose origin names no channel a
+  human reads — the usual case for a job dispatched from a cron or wake
+  session, `origin.platform = "webhook"`, and for `local`/unknown/empty
+  origins, a messaging platform with no usable chat id, or a `webui` origin
+  with no usable session id — used to finish **silently**: the report was
+  durable in
+  `pi_status`/`final_result.md`, and `delivery.reason` was
+  `no-delivery-channel`/`no-origin` with `attempted: false`. Now exactly one
+  copy of the same bounded summary goes to the one operator-configured chat
+  (`"telegram:261266401"`), recorded as `kind: send-fallback`,
+  `channel: "<platform>-fallback"`, `ok: true`. Off by default (unset = the
+  old behaviour byte for byte), never retried, never derived from a job — the
+  target comes only from the operator's `wake.json` or environment, a
+  malformed or non-messaging target disables the fallback rather than being
+  guessed, and a `webui` job with a session still runs no CLI at all (and no
+  fallback is ever planned onto a missing `hermes` binary). The
+  per-turn `already-attempted` guard means a restart or re-entry cannot send a
+  second copy. `deliver.plan()` takes an optional `fallback` argument; the
+  watchdog's `needs_attention` message uses the same target policy (a separate
+  notice, one per transition into `needs_attention`, never a second copy of a
+  delivery), and `PI_BRIDGE_DELIVERY_FALLBACK` is forwarded to the runner unit
+  with the other delivery knobs so systemd and detach modes agree.
+  Motivation: STAGE-4 T15 (jobs `pb-20261029T210800Z-51c098`,
+  `pb-20261030T105651Z-491ce5` and six siblings completed with no
+  notification).
+
 ## 0.5.0 — 2026-10-21 (protocol V1.5, unchanged — fully backward-compatible)
 
 * **Autonomous stall watchdog.** A bridge-owned systemd user timer runs
