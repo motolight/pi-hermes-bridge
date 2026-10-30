@@ -10,7 +10,10 @@ final reply went to the route's `deliver: log` sink.  `wake.delivered: true`
 while the user saw nothing.
 
 The fix moved user-visible delivery out of the model's shell and into the
-runner, strictly by origin, with no fallback channel.  Since V1.5 the runner
+runner, strictly by origin, with no fallback channel -- and since 2026-10-30
+(STAGE-4 T15) with ONE opt-in fallback (`wake.json` `fallback_channel`) for the
+job that has no channel at all, which is how a cron/wake-dispatched job
+(`origin.platform = "webhook"`) used to finish silently.  Since V1.5 the runner
 runs a `hermes` CLI ONLY for messaging platforms (`hermes send`): a webui
 origin is no longer a subprocess at all.  `hermes --resume <sid> chat -q ...`
 raced the live WebUI backend over one session (SESSION_NOT_OWNED on one
