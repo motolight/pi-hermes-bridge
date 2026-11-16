@@ -3,6 +3,14 @@
 # NOTE: bridge smoke tier, NOT Attest model-cassette replay.
 set -euo pipefail
 
+# A disposable worktree is NOT an OS security boundary. Refuse to execute
+# agent tests on a normal user/production host by default. The explicit
+# override is for a dedicated throwaway VM/container only.
+if [[ "${GITHUB_ACTIONS:-}" != "true" && "${HERMES_PI_SANDBOX_CONFIRMED:-}" != "1" ]]; then
+  echo "FAIL unisolated-host"
+  exit 1
+fi
+
 root="$(cd "$(dirname "$0")" && pwd)"
 if ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL sandbox"
