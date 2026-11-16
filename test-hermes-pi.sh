@@ -32,6 +32,9 @@ while read -r test label; do
     echo "PASS $label"
   else
     echo "FAIL $label"
+    if printenv GITHUB_ACTIONS >/dev/null 2>&1; then
+      tail -n 60 "$tmp/logs/$label.log" >&2
+    fi
     failed=1
   fi
 done <<'TESTS'
