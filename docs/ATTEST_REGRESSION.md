@@ -6,7 +6,11 @@ must not be represented as end-to-end acceptance of a real Hermes + Pi agent.
 
 ## Implemented
 
-- bash test-hermes-pi.sh: detached disposable git worktree from HEAD
+- bash test-hermes-pi.sh: detached disposable git worktree from HEAD.
+  A worktree is NOT a process/filesystem sandbox: for safety, this smoke
+  harness refuses local execution by default. It runs unattended only in
+  ephemeral GitHub Actions; on a verified disposable test VM/container
+  set HERMES_PI_SANDBOX_CONFIRMED=1. Never set that on production.
 - Each test uses the CURRENT pi_bridge runner/CLI and isolated bridge HOME,
   but a scripted fake Pi. No live LLM or production agent.
 - Five PASS/FAIL lines, non-zero exit on failure. PR CI runs these tests.
