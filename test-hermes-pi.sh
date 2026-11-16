@@ -25,7 +25,7 @@ cd "$sandbox"
 failed=0
 while read -r test label; do
   if timeout 90s env -i PATH="$PATH" HOME="$tmp/home" LANG="C.UTF-8" \
-      PYTHONDONTWRITEBYTECODE=1 PI_BRIDGE_NO_PIWEB=1 \
+      PYTHONPATH="$sandbox" PYTHONDONTWRITEBYTECODE=1 PI_BRIDGE_NO_PIWEB=1 \
       python3 -m pytest -q --tb=short \
       "tests/test_attest_regression.py::$test" \
       >"$tmp/logs/$label.log" 2>&1; then
