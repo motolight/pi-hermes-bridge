@@ -380,7 +380,7 @@ _HANDLERS = {
 # two implementations against shared fixtures.
 _WEBUI_POLL_SECONDS = 3.0
 _WEBUI_INFLIGHT_STALE_S = 120.0
-_PLUGIN_VERSION = "0.5.0"    # keep in sync with pyproject.toml project.version
+_PLUGIN_VERSION = "0.6.0"    # keep in sync with pyproject.toml project.version
 _WEBUI_PROTOCOL = "V1.5"
 _DEFAULT_MAX_ATTEMPTS = 1200   # ~1 h at the 3 s tick
 
