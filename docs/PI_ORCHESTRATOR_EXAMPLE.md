@@ -59,3 +59,25 @@ Key properties that matter for the bridge contract:
 * Subagent transcripts live in the Pi session store next to the main session
   (e.g. a `subagents/` subdirectory); PI WEB shows the main transcript, with
   subagent activity embedded as tool-call records.
+
+## GPU-sharing discipline (subagents)
+
+Pi and Hermes share one inference backend on this server, and every subagent is
+another concurrent model request that slows down every other running job — the
+whole point of delegating is lost if a job fans out into a dozen parallel
+generations. Keep the number of *simultaneous* generations small:
+
+- Delegate at most 2 subagents at a time: issue no more than two `subagent`
+  calls in a single message, wait for their results, then send the next batch.
+- Prefer one subagent when one is enough; do not delegate work you can do
+  yourself in the same number of steps, and never re-run a subagent to redo
+  work it already reported.
+- This caps concurrency, not delegation: use as many subagents as the task
+  genuinely needs, just in waves of at most two.
+
+pi-open-agents has no stock concurrency limit for `subagent` (only `maxDepth`
+and `allowedAgents`), so this rule is the only lever available without
+patching the package. It is guidance, not a cap — the hard cap is the job's
+queue slot (`docs/PERF_CAPACITY.md`). A `pi-open-agents` update rewrites the
+installed `~/.pi/agent/agents/orchestrator.md`, so re-apply this section after
+upgrading.

@@ -311,6 +311,13 @@ def test_queue_status_cli_reports_slots(env, workdir):
     assert a["job_id"] in [j["job_id"] for j in s["running_jobs"]]
     assert wait_terminal(a["job_id"])["status"] == "completed"
     assert wait_terminal(b["job_id"])["status"] == "completed"
+    # The persisted block is last written when the slot is claimed, so a
+    # finished job must not be reported as holding one (`running` forever).
+    rows = {r["job_id"]: r for r in json.loads(bridge("list", "--json").stdout)}
+    for job_id in (a["job_id"], b["job_id"]):
+        assert rows[job_id]["queue"]["state"] == "finished", rows[job_id]
+        assert rows[job_id]["queue"]["class"] == "heavy"
+        assert _status(job_id)["queue"]["state"] == "finished"
 
 
 def test_feedback_reenters_the_queue(env, workdir):

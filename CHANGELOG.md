@@ -7,6 +7,23 @@ revision, which is tracked independently of the package version.
 
 ## Unreleased — protocol V1.5 (unchanged), backward-compatible
 
+* **`pi_list` reported finished jobs as holding a queue slot.** The queue
+  block is last written when a runner claims the slot, so nothing rewrote it
+  at teardown and every completed job kept saying `"state": "running"` in the
+  `list` view forever (`pi_status` mapped it correctly, `list` did not). The
+  mapping is now one function, `queue.display_state()`, used by both views:
+  a job in a terminal status is `finished`.
+* **FIFO order was not exact inside the same second.** `created_at` is
+  second-resolution and job ids end in random hex, so two jobs submitted
+  within one second could be admitted in the wrong order; admission now
+  orders by a nanosecond enqueue key written at submit time (`queued_at_ns`,
+  internal — not part of any view), with the old
+  `(created_at, job_id)` order as the fallback for job files written before
+  the queue existed.
+* **`docs/PERF_CAPACITY.md`**: the measured numbers behind the queue, the
+  before/after run, the verified compaction threshold and the rollback
+  command for each knob.
+
 * **Durable FIFO job queue.** Pi and Hermes share one inference backend, so
   every concurrently running Pi job (and every subagent inside it) is another
   competing request against the same GPU: a measured nightly batch of 8–9

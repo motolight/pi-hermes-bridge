@@ -278,6 +278,10 @@ large the configured budget is. `pi_status`/`pi_list` carry the queue view
 (`class`, `state: waiting|running|finished`, `position` in line); it is purely
 informational and never changes job semantics.
 
+The measurements behind these defaults — a before/after run of the same job
+package, the verified Pi compaction threshold and the rollback command for
+each knob — are in [`docs/PERF_CAPACITY.md`](docs/PERF_CAPACITY.md).
+
 ## Pi orchestrator example
 
 The bridge always invokes `pi --agent orchestrator`; the `--agent` flag and the

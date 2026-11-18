@@ -655,8 +655,8 @@ def list_rows(jobs: list[dict], limit: int = LIST_LIMIT_DEFAULT) -> list[dict]:
             # queue class/state only (additive): a recovery run can
             # see whether a job is waiting for a slot and how it is
             # classified, without a second scan of the jobs dir.
-            "queue": {k: v for k, v in queue.normalize_block(job).items()
-                      if k in ("class", "state")},
+            "queue": {"class": queue.job_class(job),
+                      "state": queue.display_state(job)},
         })
     rows.sort(key=lambda r: (r.get("updated_at") or "", r.get("job_id") or ""),
               reverse=True)

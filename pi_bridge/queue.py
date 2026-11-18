@@ -386,11 +386,23 @@ def pump(reason: str = "") -> dict:
 # views
 # --------------------------------------------------------------------------
 
+def display_state(job: dict) -> str:
+    """Queue state for reports and CLI views.
+
+    The persisted block is last written when the runner claims the slot, so a
+    finished job would otherwise still read `running` forever -- nothing
+    rewrites it at teardown, and a terminal job does not hold a slot.
+    """
+    if job.get("status") in state.TERMINAL_STATUSES:
+        return "finished"
+    return normalize_block(job)["state"]
+
+
 def view(job: dict, jobs: list[dict] | None = None) -> dict:
     """Per-job queue view (additive in pi_status; never affects semantics)."""
     b = normalize_block(job)
+    b["state"] = display_state(job)
     if job.get("status") in state.TERMINAL_STATUSES:
-        b["state"] = "finished"
         b["position"] = None
         b.pop("queued_at_ns", None)
         return b
