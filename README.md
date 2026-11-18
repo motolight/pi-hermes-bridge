@@ -194,6 +194,16 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   message plus a `pi_bridge_stall` event to Hermes on a separate route/policy.
   Server-side by design: independent of any browser, WebUI or pi-lamp
   connection. See [`docs/STALL_WATCHDOG.md`](docs/STALL_WATCHDOG.md).
+* **Durable FIFO job queue** — Pi and Hermes share one inference backend, so
+  every concurrently running job (and every subagent inside it) is a separate
+  competing request. The queue caps how many jobs execute at the same time:
+  by default **one heavy job plus one light/urgent job**, the rest wait. It is
+  strictly FIFO inside a class and durable in the simplest possible way — a
+  waiting job is just a `queued` job with no runner anchor in `job.json`, so
+  it survives a gateway/runner restart and a reboot with nothing extra to
+  replay, and jobs already running when you turn the queue on are never
+  touched. Configure it in `<bridge_home>/config.json` or with the
+  environment; see [Job queue](#job-queue-gpu-capacity-control).
 * **Safety** — no `shell=True`, task via stdin, argv only, generated job ids,
   bounded outputs, structured errors, secrets never stored in job state.
 * **Live WebUI status badges (optional, `extensions/pi-lamp/`)** — a
@@ -206,6 +216,67 @@ Hermes webhook platform beyond loopback — not recommended), env overrides in
   abandoned — the lamp no longer lies green about an unreceived result.
   No new port, no sidecar, no LLM in the loop; see
   [`extensions/pi-lamp/README.md`](extensions/pi-lamp/README.md).
+
+## Job queue (GPU capacity control)
+
+Pi and Hermes call the same model, so the number of simultaneously running Pi
+jobs is the capacity knob of the whole setup. Admission is a single FIFO pass
+over the jobs directory: a job that may run gets its runner launched, the
+rest wait in `queued`.
+
+**Slots and classes.** Every job has a class: `heavy` (the default — exactly
+the pre-queue behaviour) or `light` for quick/interactive work:
+
+```
+pi-bridge submit --light --cwd DIR --task "..."
+```
+
+Each class has its own slot budget (default `1` heavy + `1` light), and a job
+only consumes a slot of its own class. That is why the queue is FIFO *per
+class*: an urgent light job never waits behind a long heavy one, and a light
+job never occupies the heavy slot (a single global FIFO would make the extra
+interactive slot useless). A feedback turn re-enters the queue like any other
+execution, with the job's own class.
+
+**Durability.** A waiting job is a `queued` job whose `last_run` is still
+`null` — the queue has no separate ledger, so restarting the gateway or the
+runner (or rebooting the host) cannot lose it. Jobs that were already running
+before the queue existed keep their slot and finish normally.
+
+**Pumps.** Admission runs on `submit`/`feedback` (so an idle bridge still
+starts the job immediately), when a runner finalizes a turn, on `cancel`, from
+the bridge-owned watchdog systemd timer (the durable pump that a restart
+cannot stop) and manually:
+
+```
+pi-bridge queue status        # slot budget, what runs, who waits and in what order
+pi-bridge queue pump          # run one FIFO admission pass now
+```
+
+**Configuration** — `<bridge_home>/config.json` (default
+`~/.local/state/pi-bridge/config.json`), all keys optional:
+
+```json
+{
+  "queue": {
+    "enabled": true,
+    "heavy_slots": 1,
+    "light_slots": 1
+  }
+}
+```
+
+| Environment (highest priority) | Meaning |
+|---|---|
+| `PI_BRIDGE_QUEUE=0` | switch the queue off: `submit` launches the runner immediately, exactly like bridge ≤ 0.5.0 |
+| `PI_BRIDGE_QUEUE_HEAVY_SLOTS=N` | heavy slot budget (`0` is valid: heavy jobs do not start) |
+| `PI_BRIDGE_QUEUE_LIGHT_SLOTS=N` | light slot budget |
+
+Capacity is read on every pass, so changing the budget takes effect from the
+next pump — no restart. A single pass never launches more than 8 jobs, however
+large the configured budget is. `pi_status`/`pi_list` carry the queue view
+(`class`, `state: waiting|running|finished`, `position` in line); it is purely
+informational and never changes job semantics.
 
 ## Pi orchestrator example
 

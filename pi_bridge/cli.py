@@ -1,6 +1,8 @@
 """pi-bridge CLI.
 
 pi-bridge submit   [--cwd DIR] [--task TEXT | --task-file F]  (default: task on stdin)
+                   [--light]            (ask for the light/urgent queue slot;
+                   default = heavy, the pre-queue behaviour)
                    [--origin-platform P] [--origin-chat-id ID] [--origin-thread-id T]
                    [--origin-ui-session-id S]   (delivery origin metadata; invalid
                    values are dropped, never an error; the bridge never routes on it)
@@ -8,6 +10,8 @@ pi-bridge status   JOB_ID [--json] [--full]
 pi-bridge feedback JOB_ID [--feedback TEXT | --feedback-file F]  (default: on stdin)
 pi-bridge cancel   JOB_ID [--json]
 pi-bridge list     [--limit N] [--json]
+pi-bridge queue    status [--json]   (read-only: slot budget, running and waiting jobs)
+pi-bridge queue    pump  [--json]    (run one FIFO admission pass now)
 pi-bridge health   [--json]  (read-only poller health records, one row per live poller pid)
 pi-bridge watchdog tick      (one stall-watchdog evaluation pass; systemd-timer entry point)
 pi-bridge watchdog status [--json]  (read-only watchdog heartbeat + per-job watchdog state)
@@ -78,6 +82,9 @@ def main(argv=None) -> int:
                     help="thread/topic id of the requesting session (optional)")
     sp.add_argument("--origin-ui-session-id", default="",
                     help="UI session id for webui-originated requests (optional)")
+    sp.add_argument("--light", action="store_true",
+                    help="use the light/urgent queue slot instead of the heavy one "
+                         "(default: heavy; ignored when the queue is disabled)")
     sp.add_argument("--json", action="store_true")
 
     st = sub.add_parser("status", help="show job status")
@@ -145,6 +152,15 @@ def main(argv=None) -> int:
                          f"{bridge.LIST_LIMIT_DEFAULT})")
     ls.add_argument("--json", action="store_true")
 
+    qu = sub.add_parser("queue",
+                        help="durable FIFO job queue: status + manual admission pump")
+    qu_sub = qu.add_subparsers(dest="queue_cmd", required=True)
+    qs = qu_sub.add_parser("status", help="read-only slot budget, running and waiting jobs")
+    qs.add_argument("--json", action="store_true")
+    qp = qu_sub.add_parser("pump", help="run one FIFO admission pass now")
+    qp.add_argument("--json", action="store_true",
+                    help="accepted for symmetry; output is always JSON")
+
     wi = sub.add_parser("web-info",
                         help="read-only PI WEB observability view of a job")
     wi.add_argument("job_id")
@@ -182,7 +198,8 @@ def main(argv=None) -> int:
                 ui_session_id=args.origin_ui_session_id,
             )
             job = bridge.submit(task, args.cwd, pi_bin=args.pi_bin,
-                                session_id=args.session_id, origin=origin)
+                                session_id=args.session_id, origin=origin,
+                                light=args.light)
             if args.json:
                 print(json.dumps(bridge.status_view(job), ensure_ascii=False))
             else:
@@ -204,6 +221,15 @@ def main(argv=None) -> int:
                 print(json.dumps(bridge.status_view(job), ensure_ascii=False))
             else:
                 print(f"{job['job_id']}: {job['status']}")
+        elif args.cmd == "queue":
+            from . import queue as bridge_queue
+            if args.queue_cmd == "status":
+                out = bridge_queue.summary()
+            else:
+                out = bridge_queue.pump(reason="cli")
+            print(json.dumps(out, ensure_ascii=False))
+            if out.get("error"):
+                return 2
         elif args.cmd == "web-info":
             job = state.load_job(args.job_id)
             print(json.dumps(bridge.piweb_view(job), ensure_ascii=False))

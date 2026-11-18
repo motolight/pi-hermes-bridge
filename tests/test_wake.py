@@ -422,10 +422,12 @@ def test_wake_permanent_error_gives_up_early(env, workdir):
 # --------------------------------------------------------------------------
 
 # V1.4 adds the origin-delivery summary to the compact row as well.
-# v0.5.0 adds the compact watchdog state to the row as well.
+# v0.5.0 adds the compact watchdog state to the row as well.  The durable
+# FIFO queue adds the compact queue class/state so a recovery run can see
+# whether a job is merely waiting for capacity.
 LIST_KEYS = {"job_id", "status", "cwd", "created_at", "updated_at",
              "task_preview", "feedback_turns", "turns", "wake", "delivery",
-             "origin", "watchdog"}
+             "origin", "watchdog", "queue"}
 
 
 def test_pi_list_rows_limit_and_no_transcript(env, workdir):

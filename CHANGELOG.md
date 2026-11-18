@@ -7,6 +7,31 @@ revision, which is tracked independently of the package version.
 
 ## Unreleased — protocol V1.5 (unchanged), backward-compatible
 
+* **Durable FIFO job queue.** Pi and Hermes share one inference backend, so
+  every concurrently running Pi job (and every subagent inside it) is another
+  competing request against the same GPU: a measured nightly batch of 8–9
+  simultaneous jobs is what made model answers ~3x slower for everything
+  else. `submit` and `feedback` now persist the job as `queued` with no
+  runner anchor and run one FIFO admission pass; the rest of the line waits.
+  A job has a class — `heavy` (default, the pre-queue behaviour) or `light`
+  (`submit --light`) — and each class has its own slot budget (default 1
+  heavy + 1 light), so the queue is strict FIFO *within* a class and a light
+  job never waits behind a long heavy one. There is no second source of
+  truth: a waiting job is a `queued` job whose `last_run` is still `null`, so
+  the queue survives a runner/gateway restart and a reboot with nothing to
+  replay, jobs that were already running when the queue arrived are never
+  touched, and `reconcile` no longer calls a slot-waiting job `interrupted`
+  (it has no runner by design). Pumps: submit/feedback, a runner finalizing a
+  turn (before delivery and wake, so waiting jobs do not sit behind a 45-minute
+  retry loop), `cancel`, the bridge-owned watchdog timer, and
+  `pi-bridge queue pump`; `pi-bridge queue status` shows budget/running/waiting.
+  Config: `config.json` `queue.{enabled,heavy_slots,light_slots}` (read on
+  every pass, so capacity changes apply without a restart) with environment
+  overrides `PI_BRIDGE_QUEUE=0`, `PI_BRIDGE_QUEUE_HEAVY_SLOTS`,
+  `PI_BRIDGE_QUEUE_LIGHT_SLOTS`; `PI_BRIDGE_QUEUE=0` restores the
+  pre-queue "launch immediately" behaviour exactly. `pi_status`/`pi_list`
+  carry an additive `queue` view (class, state, position in line).
+
 * **Opt-in fallback delivery channel** (`wake.json` `fallback_channel`,
   env `PI_BRIDGE_DELIVERY_FALLBACK`). A job whose origin names no channel a
   human reads — the usual case for a job dispatched from a cron or wake

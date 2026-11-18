@@ -1308,9 +1308,16 @@ def _finalize_terminal(job: dict) -> None:
 def _tick() -> dict:
     cfg = load_config()
     events = flush_events(cfg)
+    # The watchdog timer doubles as the durable pump of the job queue: it is
+    # a bridge-owned systemd user timer, so it keeps admitting waiting jobs
+    # across gateway/runner restarts and reboots.  The pump never raises and
+    # never touches watchdog bookkeeping.
+    from . import queue as bridge_queue
+    queue_pump = bridge_queue.pump(reason="timer")
     if not cfg["enabled"]:
-        _save_heartbeat({"disabled": True, "events": events})
-        return {"disabled": True, "events": events}
+        _save_heartbeat({"disabled": True, "events": events,
+                         "queue": queue_pump})
+        return {"disabled": True, "events": events, "queue": queue_pump}
     now = time.time()
     counts: dict[str, int] = {}
     actions: dict[str, int] = {}
@@ -1335,9 +1342,9 @@ def _tick() -> dict:
         a = res.get("action", "?")
         actions[a] = actions.get(a, 0) + 1
     _save_heartbeat({"events": events, "scanned": scanned, "states": counts,
-                     "actions": actions})
+                     "actions": actions, "queue": queue_pump})
     return {"scanned": scanned, "states": counts, "actions": actions,
-            "events": events}
+            "events": events, "queue": queue_pump}
 
 
 # ---------------------------------------------------------------------------

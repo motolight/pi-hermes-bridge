@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import deliver, piweb, state, wake, watchdog as wdog
+from . import deliver, piweb, queue, state, wake, watchdog as wdog
 from .state import BridgeError
 
 # Max chars of the final result kept inside job.json / returned by status.
@@ -209,6 +209,8 @@ def _unit_name(job_id: str, turn: int) -> str:
 # files (wake.json) are unaffected; nothing secret is ever forwarded.
 FORWARD_ENV_KEYS = (
     "PI_BRIDGE_WAKE_INTERVAL", "PI_BRIDGE_WAKE_MAX_ATTEMPTS",
+    "PI_BRIDGE_QUEUE", "PI_BRIDGE_QUEUE_HEAVY_SLOTS",
+    "PI_BRIDGE_QUEUE_LIGHT_SLOTS",
     "PI_BRIDGE_WAKE_PERMANENT_AFTER", "PI_BRIDGE_WAKE_HTTP_TIMEOUT",
     "PI_BRIDGE_WAKE_PIWEB_BUDGET", "PI_BRIDGE_NO_PIWEB",
     "PI_BRIDGE_PIWEB_BUDGET", "PI_BRIDGE_RESULT_LIMIT",
@@ -363,7 +365,19 @@ def _refuse_if_pi_alive(job: dict) -> None:
 
 
 def submit(task: str, cwd: str, pi_bin: str | None = None,
-           session_id: str | None = None, origin: dict | None = None) -> dict:
+           session_id: str | None = None, origin: dict | None = None,
+           light: bool = False) -> dict:
+    """Create a job and put it in the queue.
+
+    With the queue enabled (the default) the job is durably persisted as
+    `queued` with NO runner anchor, and one FIFO admission pass runs
+    immediately: if a slot of the job's class is free the job starts in this
+    very call, otherwise it waits for the next pump (a finishing runner, the
+    watchdog timer or `pi-bridge queue pump`).  `light=True` (CLI
+    `--light`) asks for the light/urgent slot instead of the heavy one.
+    With the queue disabled (`PI_BRIDGE_QUEUE=0`) the pre-0.6 behaviour is
+    reproduced byte for byte: launch the runner right away.
+    """
     if not task or not task.strip():
         raise BridgeError("task is empty")
     if len(task) > MAX_TASK_CHARS:
@@ -374,6 +388,9 @@ def submit(task: str, cwd: str, pi_bin: str | None = None,
         session_id = str(uuid.uuid4())
     if not state.SESSION_ID_RE.match(session_id):
         raise BridgeError(f"invalid session id: {session_id!r}")
+    queued_enabled = queue.is_enabled()
+    # Validated even when the queue is on: _plan_launcher is what the claim
+    # path will call, and a bad PI_BRIDGE_LAUNCHER must fail at submit time.
     launcher_kind = _plan_launcher()
 
     job_id = state.gen_job_id()
@@ -394,7 +411,10 @@ def submit(task: str, cwd: str, pi_bin: str | None = None,
         "feedbacks": [],
         "turns": [{"n": 1, "kind": "task", "started_at": state.now_iso(),
                    "finished_at": None, "exit_code": None, "pi_pid": None}],
-        "last_run": _pre_launch_anchor(job_id, 1, launcher_kind),
+        "last_run": (None if queued_enabled
+                     else _pre_launch_anchor(job_id, 1, launcher_kind)),
+        "job_class": "light" if light else "heavy",
+        "queue": queue.new_block(job_id, "light" if light else "heavy"),
         "cancel_requested": False,
         "env_snapshot": _env_snapshot(),
         "wake": wake.blank_state(wake.is_enabled()),
@@ -411,6 +431,12 @@ def submit(task: str, cwd: str, pi_bin: str | None = None,
     # Full job state (including turn entry and liveness anchor) exists
     # BEFORE the runner can start.
     state.save_job(job)
+    if queued_enabled:
+        # Admission runs synchronously, so an idle bridge still starts the
+        # job here.  A launch failure leaves the job waiting (retryable) and
+        # is reported to the caller, like submit used to report it.
+        queue.admit(reason="submit")
+        return state.load_job(job_id)
     launched = _launch_runner(job_id, 1, job["last_run"])
     return _post_launch_merge(job_id, launched)
 
@@ -429,6 +455,7 @@ def feedback(job_id: str, text: str) -> dict:
         if len(text) > MAX_TASK_CHARS:
             raise BridgeError(f"feedback too large ({len(text)} chars)")
         turn = len(job["turns"]) + 1
+        queued_enabled = queue.is_enabled()
         launcher_kind = _plan_launcher()
         job["status"] = "queued"
         job["cancel_requested"] = False
@@ -437,11 +464,19 @@ def feedback(job_id: str, text: str) -> dict:
                              "started_at": state.now_iso(),
                              "finished_at": None, "exit_code": None,
                              "pi_pid": None})
-        job["last_run"] = _pre_launch_anchor(job_id, turn, launcher_kind)
+        job["last_run"] = (None if queued_enabled
+                           else _pre_launch_anchor(job_id, turn,
+                                                   launcher_kind))
         # The wake state describes the CURRENT turn only: a new turn resets
-        # the delivery bookkeeping.
+        # the delivery bookkeeping.  The queue block keeps the job's class
+        # and its place in line (queued_at is re-stamped: a feedback turn
+        # enters the queue now, it does not inherit the original submit).
         job["wake"] = wake.blank_state(wake.is_enabled())
+        job["queue"] = queue.new_block(job_id, queue.job_class(job))
         state.save_job(job)
+    if queued_enabled:
+        queue.admit(reason="feedback")
+        return state.load_job(job_id)
     launched = _launch_runner(job_id, turn, job["last_run"])
     return _post_launch_merge(job_id, launched)
 
@@ -501,6 +536,11 @@ STARTUP_GRACE = 10  # seconds: systemd unit may still be spawning the runner
 def reconcile(job: dict) -> dict:
     """Lazily reconcile crashed jobs. Persists under lock; returns fresh job."""
     if job["status"] not in state.ACTIVE_STATUSES:
+        return job
+    if job["status"] == "queued" and not job.get("last_run"):
+        # Waiting for a queue slot: no runner was ever launched for this
+        # turn, so "the runner disappeared" does not apply.  (Before the
+        # queue existed a job could only be `queued` for microseconds.)
         return job
     if runner_alive(job):
         return job
@@ -563,6 +603,9 @@ def status_view(job: dict, full: bool = False) -> dict:
         "final_result_truncated": bool(job.get("final_result_truncated"))
         or len(final) > len(shown),
         "final_result": shown or None,
+        # Durable FIFO queue view (additive): class, queue state,
+        # FIFO position while waiting.  Never affects job semantics.
+        "queue": queue.view(job),
         # Optional read-only observability; never affects job semantics.
         "pi_web": piweb_view(job),
     }
@@ -609,6 +652,11 @@ def list_rows(jobs: list[dict], limit: int = LIST_LIMIT_DEFAULT) -> list[dict]:
             # see at a glance which job is being watched/recovering.
             "watchdog": {"state": wdog.normalize_state(job)["state"],
                          "attempts": wdog.normalize_state(job)["attempts"]},
+            # queue class/state only (additive): a recovery run can
+            # see whether a job is waiting for a slot and how it is
+            # classified, without a second scan of the jobs dir.
+            "queue": {k: v for k, v in queue.normalize_block(job).items()
+                      if k in ("class", "state")},
         })
     rows.sort(key=lambda r: (r.get("updated_at") or "", r.get("job_id") or ""),
               reverse=True)
@@ -633,6 +681,27 @@ def _kill_verified_runner(pid: int, job_id: str, sig: int) -> bool:
 
 
 def cancel(job_id: str) -> dict:
+    job = reconcile(state.load_job(job_id))
+    if job["status"] not in state.ACTIVE_STATUSES:
+        raise BridgeError(f"job {job_id} is {job['status']}; nothing to cancel")
+    if job["status"] == "queued" and not job.get("last_run"):
+        # Waiting for a queue slot: there is no runner and no pi process to
+        # stop, so cancelling is a plain state transition.
+        with state.job_lock(job_id):
+            job = state.load_job(job_id)
+            if job["status"] in state.ACTIVE_STATUSES:
+                job["cancel_requested"] = True
+                job["status"] = "cancelled"
+                job["error"] = None
+                state.save_job(job)
+        return job
+    result = _cancel_running(job_id)
+    # A running job just freed its slot -- let the next waiting job in.
+    queue.pump(reason="cancel")
+    return result
+
+
+def _cancel_running(job_id: str) -> dict:
     job = reconcile(state.load_job(job_id))
     if job["status"] not in state.ACTIVE_STATUSES:
         raise BridgeError(f"job {job_id} is {job['status']}; nothing to cancel")

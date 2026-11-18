@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import deliver, state, wake
+from . import deliver, queue, state, wake
 from .state import BridgeError
 
 RESULT_KEEP = 8000            # chars of final result kept in job.json
@@ -290,6 +290,13 @@ def run_turn(job_id: str, turn_n: int) -> int:
 
         state.save_job(job)
     _log(jd, f"turn {turn_n} done status={job['status']}")
+
+    # This job no longer occupies a slot, so the durable queue can let the
+    # next waiting job in.  Runs BEFORE origin delivery and the wake
+    # notifier on purpose: those may retry for up to ~45 minutes and the
+    # waiting jobs must not sit out that window.  Never raises.
+    q = queue.pump(reason=f"turn-{turn_n}-done")
+    _log(jd, f"turn {turn_n} queue pump: {q}")
 
     # Hand the outcome back to whoever asked for it (completed/failed only).
     # Runs BEFORE the wake notifier on purpose: the user-visible result must
