@@ -488,14 +488,22 @@ def route_install(secret: str, port: int = DEFAULT_PORT,
     })
     st["wake"] = wake
     save_state(st)
-    return {"route": action, "restart_needed": restart_needed, "port": port,
-            "url_host": url_host, "route_secret": secret}
+    result = {"route": action, "restart_needed": restart_needed, "port": port,
+              "url_host": url_host, "route_secret": secret}
+    # v0.6.0: grant the plugin the canonical gateway-injection permission so
+    # a Hermes >= 0.23 host can take the public-API wake path.  A refusal
+    # here never fails the route install: the legacy wake path still works.
+    try:
+        result.update(inject_flag_install())
+    except BridgeError as exc:
+        result["inject_flag"] = f"skipped: {exc}"
+    return result
 
 
 def route_remove() -> dict:
     cfg_path = config_path()
     if not cfg_path.is_file():
-        return {"route": "absent"}
+        return {"route": "absent", **inject_flag_remove()}
     y = _Yaml()
     doc = y.load(cfg_path)
     st = load_state()
@@ -545,12 +553,96 @@ def route_remove() -> dict:
         wake["route_owned"] = False
         st["wake"] = wake
         save_state(st)
-    return {"route": "removed", "restart_needed": True}
+    return {"route": "removed", "restart_needed": True, **inject_flag_remove()}
 
 
 # ---------------------------------------------------------------------------
 # wake.json
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# plugins.entries.<plugin>.allow_gateway_injection (v0.6.0)
+# ---------------------------------------------------------------------------
+# Hermes >= 0.23 exposes a canonical plugin injection API
+# (``PluginContext.inject_message``) which the pi-worker plugin prefers for
+# webui wake when the host grants this permission.  Older Hermes ignores the
+# key entirely; uninstall removes exactly what install wrote.
+INJECT_PLUGIN = "pi-worker"
+INJECT_FLAG_KEY = "allow_gateway_injection"
+
+
+def inject_flag_install() -> dict:
+    """Idempotently set plugins.entries.pi-worker.allow_gateway_injection:
+    true.  Refuses to touch a foreign non-mapping shape; never creates a
+    second plugins/entries structure of its own design."""
+    cfg_path = config_path()
+    if not cfg_path.is_file():
+        return {"inject_flag": "no_config"}
+    y = _Yaml()
+    doc = y.load(cfg_path)
+    st = load_state()
+    plugins = _ensure_key(doc, "plugins", lambda: y.Map())
+    if not isinstance(plugins, dict):
+        raise BridgeError("top-level 'plugins:' in config.yaml is not a "
+                          "mapping; cannot set allow_gateway_injection.")
+    entries = _ensure_key(plugins, "entries", lambda: y.Map())
+    if not isinstance(entries, dict):
+        raise BridgeError("'plugins.entries' in config.yaml is not a mapping; "
+                          "cannot set allow_gateway_injection.")
+    ent = entries.get(INJECT_PLUGIN)
+    created_entry = False
+    if ent is None:
+        entries[INJECT_PLUGIN] = _cm(y, {INJECT_FLAG_KEY: True})
+        created_entry = True
+    elif isinstance(ent, dict):
+        if ent.get(INJECT_FLAG_KEY) is True and \
+                (st.get("inject_flag") or {}).get("plugin") == INJECT_PLUGIN:
+            return {"inject_flag": "unchanged"}
+        ent[INJECT_FLAG_KEY] = True
+    else:
+        raise BridgeError(f"'plugins.entries.{INJECT_PLUGIN}' is not a "
+                          "mapping; refusing to edit it.")
+    backup_file(cfg_path)
+    write_preserving_mode(cfg_path, y._dumps(doc))
+    st["inject_flag"] = {"plugin": INJECT_PLUGIN,
+                         "created_entry": created_entry}
+    save_state(st)
+    return {"inject_flag": "installed"}
+
+
+def inject_flag_remove() -> dict:
+    """Remove only what inject_flag_install wrote (tracked in our state)."""
+    st = load_state()
+    flag = st.get("inject_flag") or {}
+    st.pop("inject_flag", None)
+    save_state(st)
+    if not flag.get("plugin"):
+        return {"inject_flag": "absent"}
+    cfg_path = config_path()
+    if not cfg_path.is_file():
+        return {"inject_flag": "no_config"}
+    y = _Yaml()
+    doc = y.load(cfg_path)
+    plugins = doc.get("plugins")
+    if not isinstance(plugins, dict):
+        return {"inject_flag": "absent"}
+    entries = plugins.get("entries")
+    if not isinstance(entries, dict):
+        return {"inject_flag": "absent"}
+    ent = entries.get(flag["plugin"])
+    if not isinstance(ent, dict) or INJECT_FLAG_KEY not in ent:
+        return {"inject_flag": "absent"}
+    backup_file(cfg_path)
+    del ent[INJECT_FLAG_KEY]
+    if flag.get("created_entry") and len(ent) == 0:
+        del entries[flag["plugin"]]
+        if len(entries) == 0:
+            plugins.pop("entries", None)
+        if len(plugins) == 0:
+            doc.pop("plugins", None)
+    write_preserving_mode(cfg_path, y._dumps(doc))
+    return {"inject_flag": "removed"}
+
 
 def route_secret_in_config() -> tuple[str, int | None]:
     """Read (secret, port) of an existing pi-bridge-complete route, if any.

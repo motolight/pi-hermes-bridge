@@ -5,8 +5,30 @@ the `pyproject.toml` package version (`pi_bridge.__version__` is kept in sync);
 the `V1.x` labels in the prose and in `docs/` name the bridge protocol
 revision, which is tracked independently of the package version.
 
-## Unreleased — protocol V1.5 (unchanged), backward-compatible
+## 0.6.0 — 2026-11-18 (protocol V1.5, unchanged — verified against Hermes 0.23.2, backward-compatible to 0.22.x)
 
+* **Public plugin-API wake (Hermes >= 0.23).** The pi-worker poller now
+  prefers the canonical `PluginContext.inject_message(text, "user",
+  session_key=<ui_session_id>)` for webui completion wake on hosts that
+  expose it: no internal `async_delegations` ledger row, no in-process
+  `process_registry.completion_queue` — an accepted injection releases the
+  spool request as `delivered` (reason `public-api-injected`) and mirrors
+  the ack into the job's `delivery` field. Absence of the API, an unknown
+  signature, a refused grant or any error falls back to the legacy
+  ledger/queue path byte-for-byte, so Hermes 0.22.x behaviour is unchanged.
+* **`hermes-setup route-install` now grants the plugin the canonical
+  injection permission** (`plugins.entries.pi-worker.allow_gateway_injection:
+  true`, ruamel round-trip, ownership-tracked), and `route-remove` removes
+  exactly what was written. A refusal to edit `plugins:` never fails a
+  route install; the legacy wake path keeps working without the flag.
+* **Hermes 0.23.2 staging verification** (isolated HERMES_HOME, dedicated
+  webhook port): the full release checklist — SOUL routing, six pi_* tools,
+  origin-aware delivery, webhook wake (HMAC V2), feedback into the same Pi
+  session, watchdog/recover, gateway restart, pi-lamp, no duplicates — ran
+  green against the untouched 0.23.2 gateway; the pinned internals
+  (`gateway.session_context.get_session_env`, `async_delegations` named
+  columns, `active_sessions.json` lease, `hermes-refusal-reason:`) all
+  survive the gateway-owned-session refactor.
 * **`pi_list` reported finished jobs as holding a queue slot.** The queue
   block is last written when a runner claims the slot, so nothing rewrote it
   at teardown and every completed job kept saying `"state": "running"` in the

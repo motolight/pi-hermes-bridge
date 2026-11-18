@@ -809,3 +809,104 @@ def test_stuck_spool_is_injected_by_a_fresh_plugin_module(harness, monkeypatch):
     assert len(drain(h.registry.completion_queue)) == 1
     assert on_disk(h)["state"] == "injected"
     assert on_disk(h)["attempts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.6.0: public plugin API preferred (Hermes >= 0.23 ctx.inject_message)
+# ---------------------------------------------------------------------------
+
+class PublicCtx:
+    """Stand-in for the 0.23 PluginContext: records accepted injections."""
+
+    def __init__(self, result=True, error=None, narrow=False):
+        self.calls = []
+        self.result = result
+        self.error = error
+        self.narrow = narrow
+
+    def inject_message(self, content, role="user", *, session_key=None,
+                       origin=None):
+        if self.narrow:  # unknown signature -> TypeError at the call site
+            return self.result
+        self.calls.append((content, role, session_key, origin))
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def test_public_api_inject_is_preferred_and_terminal(harness):
+    h = harness
+    jd = make_job(h)
+    ctx = PublicCtx()
+    h.mod._CTX = ctx
+
+    h.mod._webui_poll_once()
+
+    assert ctx.calls == [("Pi-задача ...\n\nok", "user", SID, None)]
+    # the legacy seam is untouched: no queue event, no ledger row
+    assert drain(h.registry.completion_queue) == []
+    assert h.ledger == {}
+    req = on_disk(h)
+    assert req["state"] == "delivered"
+    assert req["reason"] == "public-api-injected"
+    assert inflights(h) == []
+    job = json.loads((jd / "job.json").read_text("utf-8"))
+    d = job["delivery"]
+    assert (d["attempted"], d["ok"], d["kind"], d["reason"],
+            d["channel"]) == (True, True, "webui-event",
+                              "public-api-injected", f"webui:{SID}")
+    # terminal: a second tick injects nothing more
+    h.mod._webui_poll_once()
+    assert len(ctx.calls) == 1
+
+
+def test_public_api_refused_falls_back_to_legacy_ledger(harness):
+    h = harness
+    make_job(h)
+    h.mod._CTX = PublicCtx(result=False)
+
+    h.mod._webui_poll_once()
+
+    assert len(h.registry.completion_queue.queue) == 1
+    assert f"pi-bridge-{JID_A}-t1" in h.ledger
+    assert on_disk(h)["state"] == "injected"
+
+
+def test_legacy_context_without_api_keeps_the_ledger_path(harness):
+    h = harness
+    make_job(h)
+    h.mod._CTX = object()  # 0.22 PluginContext: no inject_message attribute
+
+    h.mod._webui_poll_once()
+
+    assert len(h.registry.completion_queue.queue) == 1
+    assert f"pi-bridge-{JID_A}-t1" in h.ledger
+    assert on_disk(h)["state"] == "injected"
+
+
+def test_public_api_error_falls_back_without_burning_extra_attempts(harness):
+    h = harness
+    make_job(h)
+    h.mod._CTX = PublicCtx(error=RuntimeError("host exploded"))
+
+    h.mod._webui_poll_once()
+
+    assert len(h.registry.completion_queue.queue) == 1
+    req = on_disk(h)
+    assert req["state"] == "injected" and req["attempts"] == 1
+
+
+def test_public_api_unknown_signature_falls_back(harness):
+    h = harness
+    make_job(h)
+    ctx = PublicCtx(narrow=True)
+
+    def inject_message(self, content):  # different signature entirely
+        raise AssertionError("must not be reached")
+
+    ctx.inject_message = inject_message.__get__(ctx)
+    h.mod._CTX = ctx
+    # narrow signature: the recorded call must be the legacy one
+    h.mod._webui_poll_once()
+    assert ctx.calls == []
+    assert len(h.registry.completion_queue.queue) == 1

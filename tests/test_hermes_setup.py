@@ -525,3 +525,40 @@ def test_watchdog_remove_never_deletes_foreign_units(sb, monkeypatch):
     assert r["watchdog_units"] == "removed"
     # content-based ownership: a foreign file WITHOUT our mark survives
     assert "someone else's" in (d / hs.WATCHDOG_SERVICE).read_text()
+
+
+# ------------------------------------------------- inject flag (v0.6.0)
+
+def test_inject_flag_roundtrip_preserves_foreign_config(sb):
+    p = hs.config_path()
+    p.write_text(FOREIGN_CFG)
+    assert hs.inject_flag_install() == {"inject_flag": "installed"}
+    text = p.read_text()
+    assert "allow_gateway_injection: true" in text
+    assert "other-team-route" in text and "foreign-secret" in text
+    assert "# trailing comment survives too" in text
+    # idempotent: no second write, state unchanged
+    assert hs.inject_flag_install() == {"inject_flag": "unchanged"}
+    assert hs.inject_flag_remove() == {"inject_flag": "removed"}
+    text2 = p.read_text()
+    assert "allow_gateway_injection" not in text2 and "pi-worker" not in text2
+    assert "other-team-route" in text2
+
+
+def test_inject_flag_respects_foreign_entry_shape(sb):
+    p = hs.config_path()
+    p.write_text("model: x\nplugins: not-a-map\n")
+    with pytest.raises(BridgeError):
+        hs.inject_flag_install()
+    assert "allow_gateway_injection" not in p.read_text()
+
+
+def test_route_install_grants_and_route_remove_revokes(sb):
+    hs.config_path().write_text("model: some/model\n")
+    r = hs.route_install("s3cret", port=8644)
+    assert r["route"] in ("created_platform_and_route", "created_route")
+    assert r["inject_flag"] == "installed"
+    assert "allow_gateway_injection: true" in hs.config_path().read_text()
+    out = hs.route_remove()
+    assert out["inject_flag"] == "removed"
+    assert "allow_gateway_injection" not in hs.config_path().read_text()

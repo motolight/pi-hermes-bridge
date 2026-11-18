@@ -595,6 +595,39 @@ def _webui_inject(hermes, req):
     return evt
 
 
+# v0.6.0: the PluginContext from register(); None outside a Hermes host.
+# On Hermes >= 0.23 the context exposes the canonical public injection API
+# (``ctx.inject_message``), which replaces the internal ledger + queue path
+# entirely.  On 0.22.x the attribute does not exist and the legacy path
+# below stays in force.
+_CTX = None
+
+
+def _webui_public_inject(req):
+    """True when the host's public plugin API accepted the completion text.
+
+    Prefers ``ctx.inject_message(text, "user", session_key=<ui_session_id>)``
+    -- the canonical gateway-owned-session path (Hermes >= 0.23, gated by
+    ``plugins.entries.pi-worker.allow_gateway_injection``).  Any absence,
+    signature mismatch, refusal or error returns False so the caller falls
+    back to the legacy ledger/queue injection; this function never raises
+    and never half-delivers."""
+    ctx = _CTX
+    inject = getattr(ctx, "inject_message", None)
+    if inject is None:
+        return False
+    sid = str(req.get("ui_session_id") or "").strip()
+    text = str(req.get("text") or "")
+    if not sid or not text:
+        return False
+    try:
+        return bool(inject(text, "user", session_key=sid))
+    except TypeError:
+        return False  # unknown signature: never guess, stay legacy
+    except Exception:
+        return False
+
+
 def _webui_lease_pid(ui_session_id):
     """pid of the live lease holder of a session, or None."""
     import json as _json
@@ -1015,6 +1048,15 @@ def _webui_poll_once():
                         injected = dict(
                             claimed,
                             attempts=int(claimed.get("attempts") or 0) + 1)
+                        if _webui_public_inject(injected):
+                            # host accepted through the public API: no
+                            # ledger row exists, the ack IS the acceptance
+                            _webui_release(injected, "delivered",
+                                           reason="public-api-injected")
+                            _webui_ack_job(hermes, injected, True,
+                                           "public-api-injected")
+                            _health_event("delivered", jid)
+                            continue
                         _webui_inject(hermes, injected)
                         _webui_release(injected, "injected")
                         _health_event("injected", jid)
@@ -1026,6 +1068,13 @@ def _webui_poll_once():
                         claimed = dict(
                             claimed,
                             attempts=int(claimed.get("attempts") or 0) + 1)
+                        if _webui_public_inject(claimed):
+                            _webui_release(claimed, "delivered",
+                                           reason="public-api-injected")
+                            _webui_ack_job(hermes, claimed, True,
+                                           "public-api-injected")
+                            _health_event("delivered", jid)
+                            continue
                         _webui_inject(hermes, claimed)
                         _webui_release(claimed, "injected")
                         _health_event("injected", jid)
@@ -1059,6 +1108,13 @@ def _webui_poll_once():
                         claimed = dict(
                             claimed,
                             attempts=int(claimed.get("attempts") or 0) + 1)
+                        if _webui_public_inject(claimed):
+                            _webui_release(claimed, "delivered",
+                                           reason="public-api-injected")
+                            _webui_ack_job(hermes, claimed, True,
+                                           "public-api-injected")
+                            _health_event("delivered", jid)
+                            continue
                         _webui_inject(hermes, claimed)
                         _webui_release(claimed, "injected")
                         _health_event("injected", jid)
@@ -1118,6 +1174,8 @@ _webui_poller_state = None
 
 
 def register(ctx) -> None:
+    global _CTX
+    _CTX = ctx
     for name, schema in _SCHEMAS.items():
         ctx.register_tool(
             name=name,
